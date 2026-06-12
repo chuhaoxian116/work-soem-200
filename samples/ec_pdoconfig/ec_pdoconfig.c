@@ -10,6 +10,21 @@ static int run = 1;
 static ecx_contextt ctx;
 static uint8 IOmap[4096];
 
+// RxPDO结构体（主站→从站）：必须与映射顺序完全一致
+typedef struct {
+    uint16_t control_word;        // 0x6040:00h 控制字 UNSIGNED16
+    int8_t operation_mode;        // 0x6060:00h 操作模式 INTEGER8
+    int32_t target_position;      // 0x607A:00h 目标位置 INTEGER32
+} __attribute__((packed)) RxPDO_t;
+
+// TxPDO结构体（从站→主站）：必须与映射顺序完全一致
+typedef struct {
+    uint16_t error_code;          // 0x603F:00h 错误码 UNSIGNED16
+    uint16_t status_word;         // 0x6041:00h 状态字 UNSIGNED16
+    int8_t operation_mode_display;// 0x6061:00h 操作模式显示 INTEGER8
+    int32_t actual_position;      // 0x6064:00h 位置反馈 INTEGER32
+} __attribute__((packed)) TxPDO_t;
+
 void signal_handler(int sig)
 {
     run = 0;
@@ -45,6 +60,8 @@ int main(int argc, char *argv[])
     uint8_t one = 1;
     uint32_t mapping;
     uint16_t pdo_index;
+    uint8_t rx_entries = 3; // RxPDO条目数
+    uint8_t tx_entries = 4; // TxPDO条目数
     int size;
 
     signal(SIGINT, signal_handler);
@@ -73,12 +90,18 @@ int main(int argc, char *argv[])
            // 1. 先清空RxPDO映射表
             sdo_write(&ctx, slave, 0x1600, 0x00, &zero, sizeof(uint8_t));
             
-            // 2. 设置映射条目
-            mapping = 0x607A0020; // Index:0x607A, Subindex:0x00, BitLength:32
+            // 2. 设置映射条目（顺序必须与RxPDO_t结构体一致）
+            mapping = 0x60400010; // 控制字: Index=0x6040, Subindex=0x00, BitLength=16
             sdo_write(&ctx, slave, 0x1600, 0x01, &mapping, sizeof(uint32_t));
             
+            mapping = 0x60600008; // 操作模式: Index=0x6060, Subindex=0x00, BitLength=8
+            sdo_write(&ctx, slave, 0x1600, 0x02, &mapping, sizeof(uint32_t));
+            
+            mapping = 0x607A0020; // 目标位置: Index=0x607A, Subindex=0x00, BitLength=32
+            sdo_write(&ctx, slave, 0x1600, 0x03, &mapping, sizeof(uint32_t));
+            
             // 3. 启用RxPDO映射表（设置条目数）
-            sdo_write(&ctx, slave, 0x1600, 0x00, &one, sizeof(uint8_t));
+            sdo_write(&ctx, slave, 0x1600, 0x00, &rx_entries, sizeof(uint8_t));
             
             // 4. 清空RxPDO分配表（0x1C12）
             sdo_write(&ctx, slave, 0x1C12, 0x00, &zero, sizeof(uint8_t));
@@ -96,12 +119,21 @@ int main(int argc, char *argv[])
             // 1. 先清空TxPDO映射表
             sdo_write(&ctx, slave, 0x1A00, 0x00, &zero, sizeof(uint8_t));
             
-            // 2. 设置映射条目
-            mapping = 0x60640020; // Index:0x6064, Subindex:0x00, BitLength:32
+            // 2. 设置映射条目（顺序必须与TxPDO_t结构体一致）
+            mapping = 0x603F0010; // 错误码: Index=0x603F, Subindex=0x00, BitLength=16
             sdo_write(&ctx, slave, 0x1A00, 0x01, &mapping, sizeof(uint32_t));
             
+            mapping = 0x60410010; // 状态字: Index=0x6041, Subindex=0x00, BitLength=16
+            sdo_write(&ctx, slave, 0x1A00, 0x02, &mapping, sizeof(uint32_t));
+            
+            mapping = 0x60610008; // 操作模式显示: Index=0x6061, Subindex=0x00, BitLength=8
+            sdo_write(&ctx, slave, 0x1A00, 0x03, &mapping, sizeof(uint32_t));
+            
+            mapping = 0x60640020; // 位置反馈: Index=0x6064, Subindex=0x00, BitLength=32
+            sdo_write(&ctx, slave, 0x1A00, 0x04, &mapping, sizeof(uint32_t));
+            
             // 3. 启用TxPDO映射表
-            sdo_write(&ctx, slave, 0x1A00, 0x00, &one, sizeof(uint8_t));
+            sdo_write(&ctx, slave, 0x1A00, 0x00, &tx_entries, sizeof(uint8_t));
             
             // 4. 清空TxPDO分配表（0x1C13）
             sdo_write(&ctx, slave, 0x1C13, 0x00, &zero, sizeof(uint8_t));
@@ -125,6 +157,16 @@ int main(int argc, char *argv[])
                    slave, ctx.slavelist[slave].Ioffset,
                    ctx.slavelist[slave].Ibytes);
 
+            // 验证PDO大小是否匹配
+            if (ctx.slavelist[slave].Obytes != sizeof(RxPDO_t)) {
+                printf("WARNING: RxPDO size mismatch! Expected %zu bytes, got %d bytes\n",
+                       sizeof(RxPDO_t), ctx.slavelist[slave].Obytes);
+            }
+            if (ctx.slavelist[slave].Ibytes != sizeof(TxPDO_t)) {
+                printf("WARNING: TxPDO size mismatch! Expected %zu bytes, got %d bytes\n",
+                       sizeof(TxPDO_t), ctx.slavelist[slave].Ibytes);
+            }
+
             // 配置分布式时钟（如果从站支持）
             if (ctx.slavelist[slave].hasdc) {
                 ecx_configdc(&ctx);
@@ -145,8 +187,13 @@ int main(int argc, char *argv[])
 
             printf("\nPDO map for TargetPosition and ActualPosition set.\n");
 
-            int32_t *target_pos = (int32_t*)ctx.slavelist[slave].outputs;
-            int32_t *actual_pos = (int32_t*)ctx.slavelist[slave].inputs;
+            RxPDO_t *rx_pdo = (RxPDO_t*)ctx.slavelist[slave].outputs;
+            TxPDO_t *tx_pdo = (TxPDO_t*)ctx.slavelist[slave].inputs;
+
+            // 初始化控制字为0（安全状态）
+            rx_pdo->control_word = 0x0000;
+            // 设置操作模式为位置模式（0x08，与你当前值一致）
+            rx_pdo->operation_mode = 0x08;
 
             while(run)
             {
@@ -154,8 +201,13 @@ int main(int argc, char *argv[])
                 wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRXM);
                 
                 if (wkc > 0) {
-                    // 读实际位置
-                    printf("ActualPosition=%d\n wkc: %d\n", *actual_pos, wkc);
+                    // 打印所有PDO数据
+                    printf("Error Code: 0x%04X | Status Word: 0x%04X | Op Mode Display: %d | Actual Position: %d | WKC: %d\n",
+                           tx_pdo->error_code,
+                           tx_pdo->status_word,
+                           tx_pdo->operation_mode_display,
+                           tx_pdo->actual_position,
+                           wkc);
                 } else {
                     printf("Processdata timeout, WKC: %d\n", wkc);
                 }
