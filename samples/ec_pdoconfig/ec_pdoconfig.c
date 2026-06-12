@@ -9,6 +9,7 @@
 static int run = 1;
 static ecx_contextt ctx;
 static uint8 IOmap[4096];
+static uint64_t count = 0;
 
 // RxPDO结构体（主站→从站）：必须与映射顺序完全一致
 typedef struct {
@@ -177,10 +178,10 @@ int main(int argc, char *argv[])
             printf("\nSwitching to OPERATIONAL state...\n");
             ctx.slavelist[slave].state = EC_STATE_OPERATIONAL;
             ecx_writestate(&ctx, slave);
-            wkc = ecx_statecheck(&ctx, slave, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE * 4);
+            wkc = ecx_statecheck(&ctx, slave, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
             if (wkc != EC_STATE_OPERATIONAL) {
-                printf("WARNING: Failed to enter OP state, current state: 0x%02X\n", 
-                       ctx.slavelist[slave].state);
+                printf("WARNING: Failed to enter OP state, wkc:%d current state: 0x%02X StatusCode=0x%4.4x : %s\n", 
+                       wkc, ctx.slavelist[slave].state, ctx.slavelist[slave].ALstatuscode, ec_ALstatuscode2string(ctx.slavelist[slave].ALstatuscode));
             } else {
                 printf("Successfully entered OPERATIONAL state\n");
             }
@@ -201,17 +202,28 @@ int main(int argc, char *argv[])
                 wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRXM);
                 
                 if (wkc > 0) {
-                    // 打印所有PDO数据
-                    printf("Error Code: 0x%04X | Status Word: 0x%04X | Op Mode Display: %d | Actual Position: %d | WKC: %d\n",
-                           tx_pdo->error_code,
-                           tx_pdo->status_word,
-                           tx_pdo->operation_mode_display,
-                           tx_pdo->actual_position,
-                           wkc);
+                    // 每5000个周期打印一次PDO数据
+                    if(count % 5000 == 0) { 
+                        // 打印所有PDO数据
+                        printf("Error Code: 0x%04X | Status Word: 0x%04X | Op Mode Display: %d | Actual Position: %d | WKC: %d | ctx State: 0x%02X\n",
+                                tx_pdo->error_code,
+                                tx_pdo->status_word,
+                                tx_pdo->operation_mode_display,
+                                tx_pdo->actual_position,
+                                wkc,
+                                ctx.slavelist[slave].state);
+                        if(ctx.slavelist[slave].state != EC_STATE_OPERATIONAL)
+                        {
+                            printf("Slave %d is not in OPERATIONAL state\n", slave);
+                            ctx.slavelist[slave].state = EC_STATE_OPERATIONAL;
+                            ecx_writestate(&ctx, slave);
+                        }
+                    }
+                    
                 } else {
                     printf("Processdata timeout, WKC: %d\n", wkc);
                 }
-
+                count++;
                 usleep(1000); // 1ms周期
             }
         }
