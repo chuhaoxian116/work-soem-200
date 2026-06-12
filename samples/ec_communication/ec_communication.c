@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 
 /*
  * This software is dual-licensed under GPLv3 and a commercial
  * license. See the file LICENSE.md distributed with this software for
@@ -12,24 +13,43 @@
 #include <signal.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <time.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sys/mman.h>
 
 #include "soem/soem.h"
 
 #define EC_TIMEOUTMON 500
-
 #define NSEC_PER_SEC  1000000000
+#define US_PER_NSEC   1000
 
 static uint8 IOmap[4096];
-static OSAL_THREAD_HANDLE threadrt, thread1;
+static OSAL_THREAD_HANDLE threadrt;
+static OSAL_THREAD_HANDLE thread1;
 static int expectedWKC;
 static int wkc;
 static int mappingdone, dorun, inOP, run, dowkccheck;
 static int currentgroup = 0;
-static int cycle = 0;
+static int warmup_cycles = 2000;
 // 默认1ms周期（1000000ns），可通过命令行参数修改
 static int64_t cycletime = 1000000;
 
 static ecx_contextt ctx;
+
+// ==============================================
+// 通讯周期抖动统计变量（RT线程独占写入）
+// ==============================================
+static int64_t total_cycles = 0;          // 总通讯周期数
+static int64_t total_time_ns = 0;         // 总运行时间(ns)
+static int64_t max_cycle_ns = 0;          // 最大周期(ns)
+static int64_t min_cycle_ns = INT64_MAX;  // 最小周期(ns)
+static int64_t current_cycle_ns = 0;      // 当前周期(ns)
+static int64_t current_jitter_ns = 0;     // 当前抖动(ns)
+static int64_t total_jitter_ns = 0;       // 总抖动(ns)
+static int64_t last_cycle_ts = 0;         // 上一周期时间戳(ns)
+static int64_t max_dc_error_ns = 0;       // 历史最大DC误差(ns)
+static int64_t total_dc_error_ns = 0;     // 总DC误差绝对值(ns)
 
 // ==============================================
 // PDO结构体定义（必须与映射顺序完全一致）
@@ -78,6 +98,17 @@ void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime)
       delta = delta - cycletime;
    }
    timeerror = -delta;
+
+   // 记录历史最大DC误差（取绝对值）跳过前面200周期
+    if (total_cycles > warmup_cycles) {
+        int64_t abs_dc_error = llabs(timeerror);
+
+        if (abs_dc_error > max_dc_error_ns)
+            max_dc_error_ns = abs_dc_error;
+
+        total_dc_error_ns += abs_dc_error;
+    }
+
    integral += timeerror;
    *offsettime = (int64)((timeerror * pgain) + (integral * igain));
 }
@@ -108,9 +139,10 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
    ec_timet ts;
    int ht;
    static int64_t toff = 0;
+   struct timespec now;
 
    dorun = 0;
-   while (!mappingdone)
+   while (!mappingdone && run)
    {
       osal_usleep(100);
    }
@@ -118,20 +150,49 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
    ht = (ts.tv_nsec / 1000000) + 1; /* round to nearest ms */
    ts.tv_nsec = ht * 1000000;
    ecx_send_processdata(&ctx);
-   while (1)
+
+   // 初始化单调时钟时间戳（不受系统时间调整影响）
+   clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+   last_cycle_ts = now.tv_sec * NSEC_PER_SEC + now.tv_nsec;
+
+   while (run)
    {
       /* calculate next cycle start */
       add_time_ns(&ts, cycletime + toff);
       /* wait to cycle start */
       osal_monotonic_sleep(&ts);
+
       if (dorun > 0)
       {
-         cycle++;
+         // ==============================================
+         // 高精度周期与抖动计算（RT线程内执行，无锁）
+         // ==============================================
+         clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+         int64_t current_ts = now.tv_sec * NSEC_PER_SEC + now.tv_nsec;
+         current_cycle_ns = current_ts - last_cycle_ts;
+         last_cycle_ts = current_ts;
+
+         // 跳过第一个不准确的周期
+         if (total_cycles > 0) {
+             total_time_ns += current_cycle_ns;
+
+             // 更新最大/最小周期
+             if (current_cycle_ns > max_cycle_ns) max_cycle_ns = current_cycle_ns;
+             if (current_cycle_ns < min_cycle_ns) min_cycle_ns = current_cycle_ns;
+
+             // 计算抖动：当前周期与平均周期的绝对偏差
+             int64_t avg_cycle_ns = total_time_ns / total_cycles;
+             current_jitter_ns = llabs(current_cycle_ns - avg_cycle_ns);
+             total_jitter_ns += current_jitter_ns;
+         }
+
+         total_cycles++;
+
+         // ==============================================
+         // 原有EtherCAT通讯逻辑
+         // ==============================================
          wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
-         if (wkc != expectedWKC)
-            dowkccheck++;
-         else
-            dowkccheck = 0;
+         dowkccheck = (wkc == expectedWKC) ? 0 : dowkccheck + 1;
 
          if (ctx.slavelist[0].hasdc && (wkc > 0))
          {
@@ -401,31 +462,95 @@ void ecatbringup(char *ifname)
             inOP = TRUE;
             run = TRUE;
 
-            // ==============================================
-            // 主循环（显示你需要的PDO数据）
-            // ==============================================
-            printf("\nStarting main loop (Ctrl+C to exit)...\n");
+            printf("\nRunning... (Ctrl+C exit)\n");
+            printf("----------------------------------------------------------------------------------------------------------------------------------\n");
+            printf("Cycle | WKC | Err | Stat | Op | Pos | DCcur(ns) | DCmax(us) | DCavg(us) | Cur(us) | Jit(us) | Max(us) | Min(us) | Avg(us) | AvgJit(us)\n");
+            printf("----------------------------------------------------------------------------------------------------------------------------------\n");
             while (run)
             {
-               printf("Cycle: %6d | WKC: %2d | Error: 0x%04X | Status: 0x%04X | OpMode: %2d | ActualPos: %8d | DC Error: %6" PRId64 " ns\r",
-                      cycle,
-                      wkc,
-                      tx_pdo->error_code,
-                      tx_pdo->status_word,
-                      tx_pdo->operation_mode_display,
-                      tx_pdo->actual_position,
-                      timeerror);
-               fflush(stdout);
+                int64_t avg_cycle_us  = 0;
+                int64_t avg_jitter_us = 0;
+                double  dc_max_us     = (double)max_dc_error_ns / US_PER_NSEC;  // 历史最大DC误差(us)
+                double  dc_avg_us     = 0;                                      // 平均DC误差(us)
 
-               osal_usleep(20000); // 20ms刷新一次显示
+                if (total_cycles > 0)
+                    avg_cycle_us = total_time_ns / total_cycles / US_PER_NSEC; // 平均通讯周期(us)
+                if (total_cycles > 1)
+                    avg_jitter_us = total_jitter_ns / (total_cycles - 1) / US_PER_NSEC; // 平均抖动(us)
+                if (total_cycles > 0)
+                    dc_avg_us = (double)total_dc_error_ns / total_cycles / US_PER_NSEC;
+                /*
+                * 实时行打印字段说明：
+                * Cycle      : 总通讯周期计数
+                * WKC        : Working Counter 工作计数器
+                * Err        : 驱动器错误码
+                * Stat       : 驱动器状态字
+                * Op         : 当前运行模式
+                * Pos        : 实际位置反馈
+                * DCcur(ns)  : 当前DC同步误差(纳秒，带正负)
+                * DCmax(us)  : 运行以来最大DC误差(微秒)
+                * DCavg(us)  : 运行以来平均DC误差(微秒)
+                * Cur(us)    : 当前单次通讯周期(微秒)
+                * Jit(us)    : 当前周期抖动(微秒)
+                * Max(us)    : 历史最大通讯周期(微秒)
+                * Min(us)    : 历史最小通讯周期(微秒)
+                * Avg(us)    : 平均通讯周期(微秒)
+                * AvgJit(us) : 平均周期抖动(微秒)
+                */
+                printf("%5" PRId64 " | %3d | %04X | %04X | %2d | %8d | %10" PRId64 " | %8.2f | %8.2f | %7" PRId64 " | %7" PRId64 " | %7" PRId64 " | %7" PRId64 " | %7" PRId64 " | %7" PRId64 "\r",
+                    total_cycles,
+                    wkc,
+                    tx_pdo ? tx_pdo->error_code : 0,
+                    tx_pdo ? tx_pdo->status_word : 0,
+                    tx_pdo ? tx_pdo->operation_mode_display : 0,
+                    tx_pdo ? tx_pdo->actual_position : 0,
+                    timeerror,
+                    dc_max_us,
+                    dc_avg_us,
+                    current_cycle_ns / US_PER_NSEC,
+                    current_jitter_ns / US_PER_NSEC,
+                    max_cycle_ns / US_PER_NSEC,
+                    min_cycle_ns / US_PER_NSEC,
+                    avg_cycle_us,
+                    avg_jitter_us);
+
+                fflush(stdout);
+               osal_usleep(200000); // 200ms刷新一次显示
             }
-            printf("\n");
+            printf("\n---------------------------------------------------------------------------------------------------------\n");
            
          }
          printf("\nShutting down EtherCAT master...\n");
          dorun = 0;
          inOP = FALSE;
          osal_usleep(100000);
+
+         // 最终汇总
+        int64_t avg_cycle_us = 0;
+        int64_t avg_jitter_us = 0;
+        double dc_avg_us = 0;
+        double dc_cur_us = (double)llabs(timeerror) / US_PER_NSEC; // 当前DC误差转us
+        double dc_max_us = (double)max_dc_error_ns / US_PER_NSEC;  // 最大DC误差转us
+
+        if (total_cycles > 0)
+        {
+            avg_cycle_us = total_time_ns / total_cycles / US_PER_NSEC;
+            dc_avg_us    = (double)total_dc_error_ns / total_cycles / US_PER_NSEC;
+        }
+        if (total_cycles > 1)
+            avg_jitter_us = total_jitter_ns / (total_cycles - 1) / US_PER_NSEC;
+
+        printf("\n========== Final Statistics ==========\n");
+        printf("Total cycles    : %" PRId64 "\n", total_cycles);       // 总运行周期数
+        printf("Avg cycle       : %" PRId64 " us\n", avg_cycle_us);    // 平均通讯周期
+        printf("Max cycle       : %" PRId64 " us\n", max_cycle_ns / US_PER_NSEC); // 最大周期
+        printf("Min cycle       : %" PRId64 " us\n", min_cycle_ns / US_PER_NSEC); // 最小周期
+        printf("Avg jitter      : %" PRId64 " us\n", avg_jitter_us);   // 平均周期抖动
+        printf("DC Current Err  : %.2f us\n", dc_cur_us);              // 当前DC同步误差
+        printf("DC Max Err      : %.2f us\n", dc_max_us);               // 最大DC同步误差
+        printf("DC Avg Err      : %.2f us\n", dc_avg_us);               // 平均DC同步误差
+        printf("======================================\n");
+
          /* Go to SAFE_OP */
          printf("EtherCAT to SAFE_OP\n");
          ctx.slavelist[0].state = EC_STATE_SAFE_OP;
@@ -446,6 +571,21 @@ int main(int argc, char *argv[])
    printf("SOEM EtherCAT Master with Manual PDO Configuration\n");
    printf("Default cycle time: 1ms\n\n");
 
+   // 全局内存锁定（必须在所有内存分配前执行）
+   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+       printf("WARNING: Failed to lock memory (need root privileges). Performance may be degraded.\n");
+   } else {
+       printf("SUCCESS: All memory locked into RAM (no swap)\n");
+   }
+
+   // 初始化全局变量
+   rx_pdo = NULL;
+   tx_pdo = NULL;
+   run = 1;
+   mappingdone = 0;
+   dorun = 0;
+   inOP = 0;
+
    // 注册信号处理函数
    signal(SIGINT, signal_handler);
    signal(SIGTERM, signal_handler);
@@ -461,6 +601,28 @@ int main(int argc, char *argv[])
       osal_thread_create_rt(&threadrt, 128000, &ecatthread, NULL);
       /* create thread to handle slave error handling in OP */
       osal_thread_create(&thread1, 128000, &ecatcheck, NULL);
+
+    // ✅ 正确：强制类型转换（把pthread_t*类型的变量转换成pthread_t）
+    struct sched_param param;
+    param.sched_priority = 99;
+    if (pthread_setschedparam((pthread_t)threadrt, SCHED_FIFO, &param) != 0) {
+        printf("WARNING: Failed to set RT thread priority to 99\n");
+    } else {
+        printf("SUCCESS: RT thread priority set to 99 (SCHED_FIFO)\n");
+    }
+
+    // ✅ 正确：强制类型转换
+    if (pthread_setname_np((pthread_t)threadrt, "rt_eccomm") != 0) {
+        printf("WARNING: Failed to set RT thread name\n");
+    } else {
+        printf("SUCCESS: RT thread renamed to 'rt_eccomm'\n");
+    }
+
+    // ✅ 正确：强制类型转换
+    if (pthread_setname_np((pthread_t)thread1, "ec_check") != 0) {
+        printf("WARNING: Failed to set error handler thread name\n");
+    }
+
       /* bringup network */
       ecatbringup(argv[1]);
    }
