@@ -57,11 +57,11 @@ int main(int argc, char *argv[])
         if (wkc > 0)
         {
             printf("%d slaves found and configured.\n", ctx.slavecount);
-            printf("Slave %d: %s\n", slave, ctx.slavelist[slave-1].name);
+            printf("Slave %d: %s\n", slave, ctx.slavelist[slave].name);
             printf("Vendor: 0x%08X, Product: 0x%08X, Revision: 0x%08X\n",
-                   ctx.slavelist[slave-1].eep_man,
-                   ctx.slavelist[slave-1].eep_id,
-                   ctx.slavelist[slave-1].eep_rev);
+                   ctx.slavelist[slave].eep_man,
+                   ctx.slavelist[slave].eep_id,
+                   ctx.slavelist[slave].eep_rev);
 
             // 关键：确保从站处于PRE-OP状态才能配置PDO
             ecx_statecheck(&ctx, slave, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
@@ -119,14 +119,14 @@ int main(int argc, char *argv[])
 
             printf("\nPDO Mapping Information:\n");
             printf("Slave %d outputs offset: %d bytes, outputs length: %d bytes\n",
-                   slave, ctx.slavelist[slave-1].Ooffset,
-                   ctx.slavelist[slave-1].Obytes);
+                   slave, ctx.slavelist[slave].Ooffset,
+                   ctx.slavelist[slave].Obytes);
             printf("Slave %d inputs offset: %d bytes, inputs length: %d bytes\n",
-                   slave, ctx.slavelist[slave-1].Ioffset,
-                   ctx.slavelist[slave-1].Ibytes);
+                   slave, ctx.slavelist[slave].Ioffset,
+                   ctx.slavelist[slave].Ibytes);
 
             // 配置分布式时钟（如果从站支持）
-            if (ctx.slavelist[slave-1].hasdc) {
+            if (ctx.slavelist[slave].hasdc) {
                 ecx_configdc(&ctx);
                 printf("Distributed clock configured\n");
             }
@@ -145,8 +145,8 @@ int main(int argc, char *argv[])
 
             printf("\nPDO map for TargetPosition and ActualPosition set.\n");
 
-            int32_t *target_pos = (int32_t*)ctx.slavelist[slave-1].outputs;
-            int32_t *actual_pos = (int32_t*)ctx.slavelist[slave-1].inputs;
+            int32_t *target_pos = (int32_t*)ctx.slavelist[slave].outputs;
+            int32_t *actual_pos = (int32_t*)ctx.slavelist[slave].inputs;
 
             while(run)
             {
@@ -155,7 +155,7 @@ int main(int argc, char *argv[])
                 
                 if (wkc > 0) {
                     // 读实际位置
-                    printf("ActualPosition=%d\n wkc: %d", *actual_pos, wkc);
+                    printf("ActualPosition=%d\n wkc: %d\n", *actual_pos, wkc);
                 } else {
                     printf("Processdata timeout, WKC: %d\n", wkc);
                 }
