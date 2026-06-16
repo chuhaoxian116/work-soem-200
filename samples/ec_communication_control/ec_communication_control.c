@@ -52,62 +52,46 @@ static int64_t max_dc_error_ns = 0;       // 历史最大DC误差(ns)
 static int64_t total_dc_error_ns = 0;     // 总DC误差绝对值(ns)
 
 // ==============================================
-// PDO结构体定义（必须与映射顺序完全一致）
+// PDO结构体定义（100%对齐DCDemo/驱动器默认顺序）
 // ==============================================
+// RxPDO（主站→从站，输出）13字节 / 104bit
+// 顺序：目标位置(32bit) → 目标速度(32bit) → 控制字(16bit) → 目标力矩(16bit) → 操作模式(8bit)
 typedef struct {
-    uint16_t control_word;        // 0x6040:00h 控制字 UNSIGNED16
-    int8_t operation_mode;        // 0x6060:00h 操作模式 INTEGER8
-    int32_t target_position;      // 0x607A:00h 目标位置 INTEGER32
+    int32_t  target_position;   // 0x607A:00 目标位置 DINT
+    int32_t  target_velocity;   // 0x60FF:00 目标速度 DINT
+    uint16_t control_word;      // 0x6040:00 控制字 UINT
+    int16_t  target_torque;     // 0x6071:00 目标力矩 INT
+    int8_t   operation_mode;    // 0x6060:00 操作模式 SINT
 } __attribute__((packed)) RxPDO_t;
 
+// TxPDO（从站→主站，输入）15字节 / 120bit
+// 顺序：实际位置(32bit) → 错误码(16bit) → 实际速度(32bit) → 状态字(16bit) → 实际力矩(16bit) → 操作模式显示(8bit)
 typedef struct {
-    uint16_t error_code;          // 0x603F:00h 错误码 UNSIGNED16
-    uint16_t status_word;         // 0x6041:00h 状态字 UNSIGNED16
-    int8_t operation_mode_display;// 0x6061:00h 操作模式显示 INTEGER8
-    int32_t actual_position;      // 0x6064:00h 位置反馈 INTEGER32
+    int32_t  actual_position;   // 0x6064:00 实际位置 DINT
+    uint16_t error_code;        // 0x603F:00 错误码 UINT
+    int32_t  actual_velocity;   // 0x606C:00 实际速度 DINT
+    uint16_t status_word;       // 0x6041:00 状态字 UINT
+    int16_t  actual_torque;     // 0x6077:00 实际力矩 INT
+    int8_t   operation_mode_display; // 0x6061:00 模式显示 SINT
 } __attribute__((packed)) TxPDO_t;
 
-// 全局PDO指针（供所有线程访问）
+// 全局PDO指针
 RxPDO_t *rx_pdo;
 TxPDO_t *tx_pdo;
 
 // ==============================================
-// Motion Control
+// Motion Control 命令结构体
 // ==============================================
-
 typedef struct
 {
-    volatile uint16_t control_word;    // 0x6040:00h 控制字 UNSIGNED16
-
-    volatile int8_t operation_mode;    // 0x6060:00h 操作模式 INTEGER8
-
-    volatile int32_t target_position;  // 0x607A:00h 目标位置 INTEGER32
-
-    volatile int enable_req;           // 启动请求，非0表示请求启动  
-
-    volatile int disable_req;          // 停止请求，非0表示请求停止
-
-    volatile int fault_reset_req;      // 复位请求，非0表示请求复位
-
-    volatile int move_req;             // 运动请求，非0表示请求执行一次运动（需要先设置目标位置）
-
-    volatile int32_t move_pos;         // 运动位置（相对于当前实际位置的增量，单位为设备计数值）
-    
-    volatile int32_t pos_moveoffset;   // 位置偏移（相对于当前实际位置的增量，单位为设备计数值），用于CLI输入
-
-    volatile int32_t step_controlword;   // step控制字，用于CLI输入的单步控制
-
-    volatile int move_req_pp;             // 运动请求，非0表示请求执行一次运动（需要先设置目标位置）
-
-    volatile int32_t move_pos_pp;         // 绝对位置
-
-    volatile int32_t move_pos_moving;     // 运动状态
+    volatile int32_t  target_position;
+    volatile int32_t  target_velocity;
+    volatile uint16_t control_word;
+    volatile int16_t  target_torque;
+    volatile int8_t   operation_mode;
 } MotionCmd_t;
 
 static MotionCmd_t motion_cmd;
-
-static OSAL_THREAD_HANDLE motion_thread;
-static OSAL_THREAD_HANDLE cli_thread;
 
 
 /* add ns to ec_timet */
@@ -153,7 +137,7 @@ void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime)
 }
 
 // ==============================================
-// SDO辅助函数（仅用于PDO配置）
+// SDO辅助函数
 // ==============================================
 int sdo_write(ecx_contextt *ctx, uint16_t slave, uint16_t index, uint8_t subindex, void *data, int size) {
     int wkc = ecx_SDOwrite(ctx, slave, index, subindex, FALSE, size, data, EC_TIMEOUTRXM);
@@ -171,6 +155,129 @@ void signal_handler(int sig) {
     dorun = 0;
     inOP = 0;
 }
+
+// ==============================================
+// 核心业务逻辑：状态机 + 老化运动（RT线程内调用，无阻塞）
+// ==============================================
+void runWork()
+{
+    static int step = 0;
+    static int v_vm = 0;
+    static int a_vm = -10;
+    static bool step_printed[6] = {false}; // 每个步骤仅打印一次
+
+    switch (step)
+    {
+        // Step 0: 故障复位 + 初始化参数
+        case 0:
+        {
+            motion_cmd.control_word = 0x0086;   // 故障复位 + 关机
+            motion_cmd.operation_mode = 0;
+            motion_cmd.target_position = tx_pdo->actual_position;
+            motion_cmd.target_velocity = 0;
+            motion_cmd.target_torque = 0;
+
+            if (!step_printed[0]) {
+                step_printed[0] = true;
+                printf("[Step 0] Fault reset sent, status: %d, position: %d , operation mode: %d\n", 
+                  tx_pdo->status_word, tx_pdo->actual_position, tx_pdo->operation_mode_display);
+            }
+            step = 100; // 延时后进入Shutdown
+        }
+        break;
+
+        // Step 100: Shutdown，等待进入 Ready to switch on
+        case 100:
+        {
+            motion_cmd.control_word = 0x0006;   // Shutdown
+            motion_cmd.operation_mode = 8;      // CSP模式
+            motion_cmd.target_position = tx_pdo->actual_position;
+
+            // 状态满足：Ready to switch on (0x0021)
+            if ((tx_pdo->status_word & 0x006F) == 0x0021) {
+                if (!step_printed[1]) {
+                    step_printed[1] = true;
+                    printf("[Step 100] Ready to switch on, status: %d, position: %d , operation mode: %d\n", 
+                     tx_pdo->status_word, tx_pdo->actual_position, tx_pdo->operation_mode_display);
+                }
+                step = 200;
+            }
+        }
+        break;
+
+        // Step 200: Switch on，等待进入 Switched on
+        case 200:
+        {
+            motion_cmd.control_word = 0x0007;   // Switch on
+            motion_cmd.target_position = tx_pdo->actual_position;
+
+            // 状态满足：Switched on (0x0023)
+            if ((tx_pdo->status_word & 0x006F) == 0x0023) {
+                if (!step_printed[2]) {
+                    step_printed[2] = true;
+                    printf("[Step 200] Switched on, status: %d, position: %d , operation mode: %d\n", 
+                     tx_pdo->status_word, tx_pdo->actual_position, tx_pdo->operation_mode_display);
+                }
+                step = 300;
+            }
+        }
+        break;
+
+        // Step 300: Enable operation，等待进入 Operation enabled
+        case 300:
+        {
+            motion_cmd.control_word = 0x000F;   // Enable operation
+            motion_cmd.target_position = tx_pdo->actual_position;
+
+            // 状态满足：Operation enabled (0x0027)
+            if ((tx_pdo->status_word & 0x006F) == 0x0027) {
+                if (!step_printed[3]) {
+                    step_printed[3] = true;
+                    printf("[Step 300] Operation enabled, status: %d, position: %d , operation mode: %d\n", 
+                     tx_pdo->status_word, tx_pdo->actual_position, tx_pdo->operation_mode_display);
+                }
+                step = 400;
+            }
+        }
+        break;
+
+        // Step 400: 完整使能，进入运行状态
+        case 400:
+        {
+            motion_cmd.control_word = 0x001F;   // 全使能（含模式位）
+            motion_cmd.target_position = tx_pdo->actual_position;
+            v_vm = 0;
+            a_vm = -100;
+
+            if (!step_printed[4]) {
+                step_printed[4] = true;
+                printf("[Step 400] Drive running, status: %d, position: %d , operation mode: %d\n", 
+                  tx_pdo->status_word, tx_pdo->actual_position, tx_pdo->operation_mode_display);
+            }
+            step = 401;
+        }
+        break;
+
+        // Step 401: 三角波速度规划（老化正反转）
+        case 401:
+        {
+            v_vm += a_vm;
+            if (v_vm > 30000) {
+                a_vm = -100;
+            } else if (v_vm < -30000) {
+                a_vm = 100;
+            }
+            motion_cmd.target_position += v_vm;
+            // 保持在本步骤循环
+        }
+        break;
+
+        default:
+            step++;
+            break;
+    }
+}
+
 
 /* Cyclic RT EtherCAT thread */
 OSAL_THREAD_FUNC_RT ecatthread(void)
@@ -190,7 +297,7 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
    ts.tv_nsec = ht * 1000000;
    ecx_send_processdata(&ctx);
 
-   // 初始化单调时钟时间戳（不受系统时间调整影响）
+   // 初始化单调时钟时间戳
    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
    last_cycle_ts = now.tv_sec * NSEC_PER_SEC + now.tv_nsec;
 
@@ -204,22 +311,19 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
       if (dorun > 0)
       {
          // ==============================================
-         // 高精度周期与抖动计算（RT线程内执行，无锁）
+         // 高精度周期与抖动计算
          // ==============================================
          clock_gettime(CLOCK_MONOTONIC_RAW, &now);
          int64_t current_ts = now.tv_sec * NSEC_PER_SEC + now.tv_nsec;
          current_cycle_ns = current_ts - last_cycle_ts;
          last_cycle_ts = current_ts;
 
-         // 跳过第一个不准确的周期
          if (total_cycles > 0) {
              total_time_ns += current_cycle_ns;
 
-             // 更新最大/最小周期
              if (current_cycle_ns > max_cycle_ns) max_cycle_ns = current_cycle_ns;
              if (current_cycle_ns < min_cycle_ns) min_cycle_ns = current_cycle_ns;
 
-             // 计算抖动：当前周期与平均周期的绝对偏差
              int64_t avg_cycle_ns = total_time_ns / total_cycles;
              current_jitter_ns = llabs(current_cycle_ns - avg_cycle_ns);
              total_jitter_ns += current_jitter_ns;
@@ -228,28 +332,29 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
          total_cycles++;
 
          // ==============================================
-         // 原有EtherCAT通讯逻辑
+         // EtherCAT 通讯：收帧
          // ==============================================
          wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
          dowkccheck = (wkc == expectedWKC) ? 0 : dowkccheck + 1;
 
          if (ctx.slavelist[0].hasdc && (wkc > 0))
          {
-            /* calculate toff to get linux time and DC synced */
             ec_sync(ctx.DCtime, cycletime, &toff);
          }
 
          // ==============================================
-         // PDO Output Update
-         // RT线程只负责搬运
+         // 业务逻辑 + PDO输出更新
          // ==============================================
-         if(rx_pdo)
+         if(rx_pdo && inOP && tx_pdo)
          {
-            rx_pdo->control_word = motion_cmd.control_word;
+            runWork();
 
-            rx_pdo->operation_mode = motion_cmd.operation_mode;
-
+            // 完整写入所有PDO字段（顺序与结构体严格一致）
             rx_pdo->target_position = motion_cmd.target_position;
+            rx_pdo->target_velocity = motion_cmd.target_velocity;
+            rx_pdo->control_word    = motion_cmd.control_word;
+            rx_pdo->target_torque   = motion_cmd.target_torque;
+            rx_pdo->operation_mode  = motion_cmd.operation_mode;
          }
 
          ecx_mbxhandler(&ctx, 0, 4);
@@ -300,13 +405,11 @@ OSAL_THREAD_FUNC ecatcheck(void)
                }
                else if (!slave->islost)
                {
-                  /* re-check state */
                   ecx_statecheck(&ctx, slaveix, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
                   if (slave->state == EC_STATE_NONE)
                   {
                      slave->islost = TRUE;
                      slave->mbxhandlerstate = ECT_MBXH_LOST;
-                     /* zero input data for this slave */
                      if (slave->Ibytes)
                      {
                         memset(slave->inputs, 0x00, slave->Ibytes);
@@ -340,452 +443,19 @@ OSAL_THREAD_FUNC ecatcheck(void)
    }
 }
 
-OSAL_THREAD_FUNC motiontask(void *arg)
-{
-   int isEnable = 0;
-    while(run)
-    {
-        if(tx_pdo == NULL)
-        {
-            usleep(10000);
-            continue;
-        }
-
-        uint16_t sw = tx_pdo->status_word;
-        
-
-        //--------------------------------------------------
-        // Fault Reset
-        //--------------------------------------------------
-
-        if(motion_cmd.fault_reset_req)
-        {
-            motion_cmd.control_word = 0x0080;
-            usleep(100000);
-
-            motion_cmd.control_word = 0x0000;
-
-            motion_cmd.fault_reset_req = 0;
-
-            printf("\nFault Reset Sent\n");
-        }
-
-        //--------------------------------------------------
-        // Disable
-        //--------------------------------------------------
-
-        if(motion_cmd.disable_req)
-        {
-            motion_cmd.control_word = 0x0000;
-
-            motion_cmd.disable_req = 0;
-
-            printf("\nDrive Disabled\n");
-        }
-
-        //--------------------------------------------------
-        // Enable Sequence
-        //--------------------------------------------------
-
-        if(motion_cmd.enable_req)
-        {
-            
-            if(!isEnable)
-            {
-              
-            }
-
-            // 402 not ready to switch on / 402 switch on disable
-            if((sw & 0x004F) == 0x0000 || (sw & 0x004F) == 0x0040)      
-            {
-               printf("Control Word: 0x0000 -> 0x0006 , status_word: 0x%04X\n", sw);
-               motion_cmd.control_word = 0x0006;
-               isEnable = 0;
-            }
-            // 402 ready to switch on
-            else if((sw & 0x006F) == 0x0021)
-            {
-               printf("Control Word: 0x0006 -> 0x0007 , status_word: 0x%04X\n", sw);
-               motion_cmd.control_word = 0x0007;
-               isEnable = 0;
-            }
-            // 402 switch on
-            else if((sw & 0x006F) == 0x0023)
-            {
-               printf("Control Word: 0x0007 -> 0x000F , status_word: 0x%04X\n", sw);
-               motion_cmd.control_word = 0x000F;
-               isEnable = 0;
-            }
-            // 402 operation enabled
-            else if((sw & 0x006F) == 0x0027)
-            {
-               // Enabled
-               if(!isEnable) {
-                  // usleep(2000);
-                  // printf("Control Word: 0x000F -> 0x001F , status_word: 0x%04X\n", sw);
-                  // motion_cmd.control_word = 0x001F;
-                   motion_cmd.target_position = tx_pdo->actual_position; // 目标位置设置为当前位置，避免启动时的意外运动
-                  printf("Drive Enabled\n");
-                  isEnable = 1;
-               }
-
-            }
-            else
-            {
-               printf("Unexpected status_word: 0x%04X\n", sw);
-               isEnable = 0;
-            }
-        }
-
-        if(motion_cmd.step_controlword)
-        {
-            printf("Applying Step Control Word: %d\n", motion_cmd.step_controlword);
-            motion_cmd.control_word = motion_cmd.step_controlword;
-            motion_cmd.step_controlword = 0;
-        }
-
-        //--------------------------------------------------
-        // Move
-        //--------------------------------------------------
-
-        if(motion_cmd.move_req)
-        {
-            if(isEnable == 0)
-            {
-               printf("Drive not enabled, cannot execute move command.\n");
-               motion_cmd.move_req = 0;
-               continue;
-            } else {
-               motion_cmd.control_word = 0x001F; // 确保在运动前处于运行状态
-               
-               motion_cmd.move_pos += motion_cmd.pos_moveoffset;
-               motion_cmd.target_position = motion_cmd.move_pos;
-               printf("---------------------------------------------------------------------------------\n");
-               printf("Executing Move Command to Position: %d\n", motion_cmd.move_pos);
-               printf("Move Command Sent : %d\n", motion_cmd.target_position);
-               printf("---------------------------------------------------------------------------------\n");
-            }
-            
-             //motion_cmd.move_pos += motion_cmd.pos_moveoffset;
-            //  motion_cmd.move_req = 0;
-            //  motion_cmd.target_position = motion_cmd.move_pos;
-            //  printf("Executing Move Command to Position: %d\n", motion_cmd.move_pos);
-            //  printf("\nMove Command Sent : %d\n", motion_cmd.target_position);
-            
-        }
-
-        //--------------------------------------------------
-        // Move PP
-        //--------------------------------------------------
-
-        if(motion_cmd.move_req_pp)
-        {
-            if(isEnable == 0)
-            {
-               printf("Drive not enabled, cannot execute move command.\n");
-               motion_cmd.move_req_pp = 0;
-               continue;
-            } else {
-               if(motion_cmd.move_pos_moving != 1) {
-                  motion_cmd.control_word = 0x000F; // 确保在运动前处于运行状态
-                  usleep(10000); // 等待状态更新
-                  motion_cmd.control_word = 0x001F; // 确保在运动前处于运行状态
-                  motion_cmd.move_pos_moving = 1; // 设置运动状态，表示正在执行位置命令
-                  motion_cmd.target_position = motion_cmd.move_pos_pp;
-                  printf("---------------------------------------------------------------------------------\n");
-                  printf("Move Command Sent : %d\n", motion_cmd.target_position);
-                  printf("---------------------------------------------------------------------------------\n");
-               } else {
-                  if((tx_pdo->status_word & 0x0400)) { // 检查是否达到目标位置（bit10）
-                     motion_cmd.move_pos_moving = 0; // 运动完成
-                     motion_cmd.move_pos_pp = (rand() % 200000) - 100000;
-                  }
-               }
-               
-            }
-        }
-
-        usleep(1000);
-    }
-}
-
-OSAL_THREAD_FUNC clitask(void *arg)
-{
-    char cmd[128];
-
-    while(run)
-    {
-        printf("\ncmd> ");
-        fflush(stdout);
-
-        if(fgets(cmd,sizeof(cmd),stdin)==NULL)
-            continue;
-
-        //--------------------------------------------------
-        // enable
-        //--------------------------------------------------
-
-        if(strncmp(cmd,"enable",6)==0)
-        {
-            motion_cmd.enable_req = 1;
-            motion_cmd.disable_req = 0;
-
-            printf("Enable Requested\n");
-        }
-
-        //--------------------------------------------------
-        // disable
-        //--------------------------------------------------
-
-        else if(strncmp(cmd,"disable",7)==0)
-        {
-            motion_cmd.disable_req = 1;
-            motion_cmd.enable_req = 0;
-            printf("Disable Requested\n");
-        }
-
-        //--------------------------------------------------
-        // reset
-        //--------------------------------------------------
-
-        else if(strncmp(cmd,"reset",5)==0)
-        {
-            motion_cmd.fault_reset_req = 1;
-        }
-
-        //--------------------------------------------------
-        // move
-        //--------------------------------------------------
-
-         else if(strncmp(cmd,"move",4)==0)
-         {
-            char input[64];
-            
-            printf("Current Position : %d\n", tx_pdo->actual_position);
-            printf("Input Position Offset : ");
-            fflush(stdout);
-
-            if(fgets(input,sizeof(input),stdin))
-            {
-               motion_cmd.pos_moveoffset = atoi(input);
-
-               motion_cmd.move_pos = tx_pdo->actual_position;
-
-               motion_cmd.move_req = 1;
-
-               printf("Move Request : %+d\n", motion_cmd.pos_moveoffset);
-               printf("Target Position : %d\n", motion_cmd.move_pos);
-            }
-         }
-
-         //--------------------------------------------------
-        // move
-        //--------------------------------------------------
-
-         else if(strncmp(cmd,"ppmove",6)==0)
-         {
-            char input[64];
-            
-            printf("Current Position : %d\n", tx_pdo->actual_position);
-            printf("Input Position PP : ");
-            fflush(stdout);
-
-            if(fgets(input,sizeof(input),stdin))
-            {
-               motion_cmd.move_pos_pp = atoi(input);
-
-               motion_cmd.move_req_pp = 1;
-
-               printf("Target Position : %d\n", motion_cmd.move_pos_pp);
-            }
-         }
-      
-        // -------------------------------------
-        // control word step
-        // -------------------------------------
-
-         else if(strncmp(cmd,"step",4)==0)
-         {
-            char input[64];
-            printf("Input control word : ");
-            fflush(stdout);
-
-            if(fgets(input,sizeof(input),stdin))
-            {
-               motion_cmd.step_controlword = atoi(input);
-            }   
-         }
-
-        //--------------------------------------------------
-        // stop
-        //--------------------------------------------------
-
-        else if(strncmp(cmd,"stop",4)==0)
-        {
-            motion_cmd.move_req = 0;
-            motion_cmd.move_req_pp = 0;
-            printf("Stop Requested\n");
-        }
-
-        //--------------------------------------------------
-        // quit
-        //--------------------------------------------------
-
-        else if(strncmp(cmd,"quit",4)==0)
-        {
-            run = 0;
-            printf("Quit Requested\n");
-            break;
-        }
-
-        //--------------------------------------------------
-        // mode
-        //--------------------------------------------------
-         else if(strncmp(cmd,"mode",4)==0)
-         {
-            char input[64];
-
-            printf("\nAvailable Modes:\n");
-            printf("  1/8 \n");
-
-            printf("\nMode> ");
-            fflush(stdout);
-
-            if(fgets(input,sizeof(input),stdin))
-            {
-               int mode = atoi(input);
-               motion_cmd.operation_mode = mode;
-               printf("Unknown Mode : %d operation_mode : %d\n", mode, motion_cmd.operation_mode);
-            }
-         }
-         
-         //--------------------------------------------------
-         // info
-         //--------------------------------------------------
-         else if(strncmp(cmd,"info",4)==0)
-         {
-            int64_t avg_cycle_us  = 0;
-            int64_t avg_jitter_us = 0;
-
-            double dc_max_us = (double)max_dc_error_ns / US_PER_NSEC;
-            double dc_avg_us = 0;
-
-            if(total_cycles > 0)
-            {
-               avg_cycle_us =
-                     total_time_ns / total_cycles / US_PER_NSEC;
-
-               dc_avg_us =
-                     (double)total_dc_error_ns /
-                     total_cycles /
-                     US_PER_NSEC;
-            }
-
-            if(total_cycles > 1)
-            {
-               avg_jitter_us =
-                     total_jitter_ns /
-                     (total_cycles - 1) /
-                     US_PER_NSEC;
-            }
-
-            printf("\n");
-            printf("========================================\n");
-            printf("Cycle Count      : %" PRId64 "\n", total_cycles);
-            printf("WKC              : %d\n", wkc);
-
-            if(tx_pdo)
-            {
-               printf("Error Code       : 0x%04X\n",tx_pdo->error_code);
-
-               printf("Status Word      : 0x%04X\n", tx_pdo->status_word);
-
-               printf("Operation Mode   : %d\n", tx_pdo->operation_mode_display);
-
-               printf("Actual Position  : %d\n", tx_pdo->actual_position);
-            }
-
-            printf("\n");
-
-            printf("Current Cycle    : %" PRId64 " us\n", current_cycle_ns / US_PER_NSEC);
-
-            printf("Max Cycle        : %" PRId64 " us\n", max_cycle_ns / US_PER_NSEC);
-
-            printf("Min Cycle        : %" PRId64 " us\n", min_cycle_ns / US_PER_NSEC);
-
-            printf("Avg Cycle        : %" PRId64 " us\n", avg_cycle_us);
-
-            printf("Avg Jitter       : %" PRId64 " us\n", avg_jitter_us);
-
-            printf("\n");
-
-            printf("Current DC Error : %.2f us\n", (double)timeerror / US_PER_NSEC);
-
-            printf("Max DC Error     : %.2f us\n", dc_max_us);
-
-            printf("Avg DC Error     : %.2f us\n", dc_avg_us);
-
-            printf("========================================\n");
-         }
-
-         //--------------------------------------------------
-         // status
-         //--------------------------------------------------
-         else if(strncmp(cmd,"status",6)==0)
-         {
-            if(tx_pdo)
-            {
-               printf("\n");
-               printf("StatusWord    : 0x%04X\n",
-                        tx_pdo->status_word);
-
-               printf("ErrorCode     : 0x%04X\n",
-                        tx_pdo->error_code);
-
-               printf("OpMode Display: %d\n",
-                        tx_pdo->operation_mode_display);
-
-               printf("ActualPos     : %d\n",
-                        tx_pdo->actual_position);
-
-               printf("TargetPos     : %d\n",
-                        motion_cmd.target_position);
-            }
-         }
-
-        //--------------------------------------------------
-        // help
-        //--------------------------------------------------
-
-        else
-        {
-            printf("\nCommands:\n");
-            printf(" enable\n");
-            printf(" disable\n");
-            printf(" reset\n");
-            printf(" mode\n");
-            printf(" move\n");
-            printf(" info\n");
-            printf(" quit\n");
-            printf(" status\n");
-        }
-    }
-}
-
 // ==============================================
-// 手动PDO配置函数（完全来自你的ec_pdoconfig.c）
+// 手动PDO配置（100%对齐DCDemo顺序）
 // ==============================================
 bool configure_pdo(uint16_t slave) {
-    printf("\nConfiguring manual PDO mapping...\n");
+    printf("\nConfiguring manual PDO mapping (align to DCDemo)...\n");
     
     uint8_t zero = 0;
     uint8_t one = 1;
     uint32_t mapping;
     uint16_t pdo_index;
-    uint8_t rx_entries = 3;
-    uint8_t tx_entries = 4;
+    uint8_t rx_entries = 5;
+    uint8_t tx_entries = 6;
 
-    // 确保从站处于PRE-OP状态才能配置PDO
     ecx_statecheck(&ctx, slave, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
     if (ctx.slavelist[slave].state != EC_STATE_PRE_OP) {
         printf("ERROR: Slave %d not in PRE-OP state, cannot configure PDO\n", slave);
@@ -793,52 +463,64 @@ bool configure_pdo(uint16_t slave) {
     }
     printf("Slave %d entered PRE-OP state\n", slave);
 
-    // 配置RxPDO 0x1600
+    // ========== RxPDO 0x1600（主站→从站） ==========
     printf("Configuring RxPDO 0x1600...\n");
     sdo_write(&ctx, slave, 0x1600, 0x00, &zero, sizeof(uint8_t));
     
-    mapping = 0x60400010; // 控制字
+    mapping = 0x607A0020; // 1. 目标位置 32bit
     sdo_write(&ctx, slave, 0x1600, 0x01, &mapping, sizeof(uint32_t));
     
-    mapping = 0x60600008; // 操作模式
+    mapping = 0x60FF0020; // 2. 目标速度 32bit
     sdo_write(&ctx, slave, 0x1600, 0x02, &mapping, sizeof(uint32_t));
     
-    mapping = 0x607A0020; // 目标位置
+    mapping = 0x60400010; // 3. 控制字 16bit
     sdo_write(&ctx, slave, 0x1600, 0x03, &mapping, sizeof(uint32_t));
+    
+    mapping = 0x60710010; // 4. 目标力矩 16bit
+    sdo_write(&ctx, slave, 0x1600, 0x04, &mapping, sizeof(uint32_t));
+    
+    mapping = 0x60600008; // 5. 操作模式 8bit
+    sdo_write(&ctx, slave, 0x1600, 0x05, &mapping, sizeof(uint32_t));
     
     sdo_write(&ctx, slave, 0x1600, 0x00, &rx_entries, sizeof(uint8_t));
     
-    // 配置RxPDO分配表 0x1C12
+    // RxPDO分配表 0x1C12
     sdo_write(&ctx, slave, 0x1C12, 0x00, &zero, sizeof(uint8_t));
     pdo_index = 0x1600;
     sdo_write(&ctx, slave, 0x1C12, 0x01, &pdo_index, sizeof(uint16_t));
     sdo_write(&ctx, slave, 0x1C12, 0x00, &one, sizeof(uint8_t));
 
-    // 配置TxPDO 0x1A00
+    // ========== TxPDO 0x1A00（从站→主站） ==========
     printf("Configuring TxPDO 0x1A00...\n");
     sdo_write(&ctx, slave, 0x1A00, 0x00, &zero, sizeof(uint8_t));
     
-    mapping = 0x603F0010; // 错误码
+    mapping = 0x60640020; // 1. 实际位置 32bit
     sdo_write(&ctx, slave, 0x1A00, 0x01, &mapping, sizeof(uint32_t));
     
-    mapping = 0x60410010; // 状态字
+    mapping = 0x603F0010; // 2. 错误码 16bit
     sdo_write(&ctx, slave, 0x1A00, 0x02, &mapping, sizeof(uint32_t));
     
-    mapping = 0x60610008; // 操作模式显示
+    mapping = 0x606C0020; // 3. 实际速度 32bit
     sdo_write(&ctx, slave, 0x1A00, 0x03, &mapping, sizeof(uint32_t));
     
-    mapping = 0x60640020; // 实际位置
+    mapping = 0x60410010; // 4. 状态字 16bit
     sdo_write(&ctx, slave, 0x1A00, 0x04, &mapping, sizeof(uint32_t));
+    
+    mapping = 0x60770010; // 5. 实际力矩 16bit
+    sdo_write(&ctx, slave, 0x1A00, 0x05, &mapping, sizeof(uint32_t));
+    
+    mapping = 0x60610008; // 6. 操作模式显示 8bit
+    sdo_write(&ctx, slave, 0x1A00, 0x06, &mapping, sizeof(uint32_t));
     
     sdo_write(&ctx, slave, 0x1A00, 0x00, &tx_entries, sizeof(uint8_t));
     
-    // 配置TxPDO分配表 0x1C13
+    // TxPDO分配表 0x1C13
     sdo_write(&ctx, slave, 0x1C13, 0x00, &zero, sizeof(uint8_t));
     pdo_index = 0x1A00;
     sdo_write(&ctx, slave, 0x1C13, 0x01, &pdo_index, sizeof(uint16_t));
     sdo_write(&ctx, slave, 0x1C13, 0x00, &one, sizeof(uint8_t));
 
-    printf("PDO mapping configuration completed successfully\n");
+    printf("PDO mapping configuration completed\n");
     return true;
 }
 
@@ -854,8 +536,7 @@ void ecatbringup(char *ifname)
       if (ctx.slavecount > 0)
       {
         ec_groupt *group = &ctx.grouplist[0];
-
-        uint16_t slave = 1; // 目标从站地址
+        uint16_t slave = 1;
 
         printf("Found %d EtherCAT slave(s)\n", ctx.slavecount);
         printf("Slave %d: %s\n", slave, ctx.slavelist[slave].name);
@@ -864,105 +545,101 @@ void ecatbringup(char *ifname)
             ctx.slavelist[slave].eep_id,
             ctx.slavelist[slave].eep_rev);
 
-        // ==============================================
-        // 关键：在ecx_config_map_group之前执行手动PDO配置
-        // ==============================================
+        // 配置PDO
         if (!configure_pdo(slave)) {
             ecx_close(&ctx);
             return;
         }
-         // 映射PDO到IOmap
-         ecx_config_map_group(&ctx, IOmap, 0);
-         expectedWKC = (group->outputsWKC * 2) + group->inputsWKC;
 
-         // 验证PDO大小
-         printf("\nPDO Mapping Information:\n");
-         printf("Slave %d outputs offset: %d bytes, outputs length: %d bytes\n",
+        // 映射PDO到IOmap
+        ecx_config_map_group(&ctx, IOmap, 0);
+        expectedWKC = (group->outputsWKC * 2) + group->inputsWKC;
+
+        // 验证PDO大小
+        printf("\nPDO Mapping Information:\n");
+        printf("Slave %d outputs offset: %d bytes, outputs length: %d bytes\n",
                 slave, ctx.slavelist[slave].Ooffset,
                 ctx.slavelist[slave].Obytes);
-         printf("Slave %d inputs offset: %d bytes, inputs length: %d bytes\n",
+        printf("Slave %d inputs offset: %d bytes, inputs length: %d bytes\n",
                 slave, ctx.slavelist[slave].Ioffset,
                 ctx.slavelist[slave].Ibytes);
 
-         if (ctx.slavelist[slave].Obytes != sizeof(RxPDO_t)) {
-             printf("WARNING: RxPDO size mismatch! Expected %zu bytes, got %d bytes\n",
+        if (ctx.slavelist[slave].Obytes != sizeof(RxPDO_t)) {
+            printf("WARNING: RxPDO size mismatch! Expected %zu bytes, got %d bytes\n",
                     sizeof(RxPDO_t), ctx.slavelist[slave].Obytes);
-         }
-         if (ctx.slavelist[slave].Ibytes != sizeof(TxPDO_t)) {
-             printf("WARNING: TxPDO size mismatch! Expected %zu bytes, got %d bytes\n",
+        }
+        if (ctx.slavelist[slave].Ibytes != sizeof(TxPDO_t)) {
+            printf("WARNING: TxPDO size mismatch! Expected %zu bytes, got %d bytes\n",
                     sizeof(TxPDO_t), ctx.slavelist[slave].Ibytes);
-         }
+        }
 
-         // 初始化全局PDO指针
-         rx_pdo = (RxPDO_t*)ctx.slavelist[slave].outputs;
-         tx_pdo = (TxPDO_t*)ctx.slavelist[slave].inputs;
+        // 初始化全局PDO指针
+        rx_pdo = (RxPDO_t*)ctx.slavelist[slave].outputs;
+        tx_pdo = (TxPDO_t*)ctx.slavelist[slave].inputs;
 
-         /* Configure distributed clocks */
-         mappingdone = 1;
-         ecx_configdc(&ctx);
+        // 初始化运动命令
+        memset((void*)&motion_cmd, 0, sizeof(motion_cmd));
 
-         /* Add all CoE slaves to cyclic mailbox handler */
-         int sdoslave = -1;
-         for (int si = 1; si <= ctx.slavecount; si++)
-         {
-            ec_slavet *slave = &ctx.slavelist[si];
-            if (slave->CoEdetails > 0)
-            {
-               ecx_slavembxcyclic(&ctx, si);
-               sdoslave = si;
-               printf(" Slave %d added to cyclic mailbox handler\n", si);
-            }
-         }
+        /* Configure distributed clocks */
+        mappingdone = 1;
+        ecx_configdc(&ctx);
 
-         /* Let network sync to clocks */
-         dorun = 1;
-         osal_usleep(1000000);
+        /* Add all CoE slaves to cyclic mailbox handler */
+        int sdoslave = -1;
+        for (int si = 1; si <= ctx.slavecount; si++)
+        {
+           ec_slavet *slave = &ctx.slavelist[si];
+           if (slave->CoEdetails > 0)
+           {
+              ecx_slavembxcyclic(&ctx, si);
+              sdoslave = si;
+              printf(" Slave %d added to cyclic mailbox handler\n", si);
+           }
+        }
 
-         /* Go to operational state */
-         ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
-         ecx_writestate(&ctx, 0);
-         ecx_statecheck(&ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+        /* Let network sync to clocks */
+        dorun = 1;
+        osal_usleep(1000000);
 
-         if (ctx.slavelist[0].state != EC_STATE_OPERATIONAL)
-         {
-            ecx_readstate(&ctx);
-            for (int si = 1; si <= ctx.slavecount; si++)
-            {
-               ec_slavet *slave = &ctx.slavelist[si];
-               if (slave->state != EC_STATE_OPERATIONAL)
-               {
-                  printf("Slave %d State=0x%2.2x StatusCode=0x%4.4x : %s\n",
-                         si,
-                         slave->state,
-                         slave->ALstatuscode,
-                         ec_ALstatuscode2string(slave->ALstatuscode));
-               }
-            }
-         }
-         else
-         {
+        /* Go to operational state */
+        ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
+        ecx_writestate(&ctx, 0);
+        ecx_statecheck(&ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
 
+        if (ctx.slavelist[0].state != EC_STATE_OPERATIONAL)
+        {
+           ecx_readstate(&ctx);
+           for (int si = 1; si <= ctx.slavecount; si++)
+           {
+              ec_slavet *slave = &ctx.slavelist[si];
+              if (slave->state != EC_STATE_OPERATIONAL)
+              {
+                 printf("Slave %d State=0x%2.2x StatusCode=0x%4.4x : %s\n",
+                        si,
+                        slave->state,
+                        slave->ALstatuscode,
+                        ec_ALstatuscode2string(slave->ALstatuscode));
+              }
+           }
+        }
+        else
+        {
             inOP = TRUE;
             run = TRUE;
-
             printf("EtherCAT OP\n");
-            printf("Type 'help' for commands\n");
 
             while(run)
             {
                int64_t avg_cycle_us  = 0;
                int64_t avg_jitter_us = 0;
-
                double dc_max_us = (double)max_dc_error_ns / US_PER_NSEC;
                double dc_avg_us = 0;
 
                if(total_cycles > 0)
                {
                   avg_cycle_us = total_time_ns / total_cycles / US_PER_NSEC;
-
                   dc_avg_us =(double)total_dc_error_ns / total_cycles / US_PER_NSEC;
                }
-
                if(total_cycles > 1)
                {
                   avg_jitter_us = total_jitter_ns / (total_cycles - 1) / US_PER_NSEC;
@@ -976,37 +653,33 @@ void ecatbringup(char *ifname)
                if(tx_pdo)
                {
                   printf("Error Code       : 0x%04X\n",tx_pdo->error_code);
-
                   printf("Status Word      : 0x%04X\n", tx_pdo->status_word);
-
                   printf("Operation Mode   : %d\n", tx_pdo->operation_mode_display);
-
                   printf("Actual Position  : %d\n", tx_pdo->actual_position);
+                  printf("Actual Velocity  : %d\n", tx_pdo->actual_velocity);
+               }
+
+               if(rx_pdo)
+               {
+                  printf("Control Word     : 0x%04X\n", rx_pdo->control_word);
+                  printf("Target Position  : %d\n", rx_pdo->target_position);
                }
 
                printf("\n");
-
                printf("Current Cycle    : %" PRId64 " us\n", current_cycle_ns / US_PER_NSEC);
-
                printf("Max Cycle        : %" PRId64 " us\n", max_cycle_ns / US_PER_NSEC);
-
                printf("Min Cycle        : %" PRId64 " us\n", min_cycle_ns / US_PER_NSEC);
-
                printf("Avg Cycle        : %" PRId64 " us\n", avg_cycle_us);
-
                printf("Avg Jitter       : %" PRId64 " us\n", avg_jitter_us);
 
                printf("\n");
-
                printf("Current DC Error : %.2f us\n", (double)timeerror / US_PER_NSEC);
-
                printf("Max DC Error     : %.2f us\n", dc_max_us);
-
                printf("Avg DC Error     : %.2f us\n", dc_avg_us);
-
                printf("========================================\n");
-               osal_usleep(1000000 * 180); // 每3分钟打印一次统计信息
+               osal_usleep(1000000 * 10); // 每10秒打印一次统计
             }
+
             printf("\nShutting down EtherCAT master...\n");
             dorun = 0;
             inOP = FALSE;
@@ -1016,8 +689,8 @@ void ecatbringup(char *ifname)
             int64_t avg_cycle_us = 0;
             int64_t avg_jitter_us = 0;
             double dc_avg_us = 0;
-            double dc_cur_us = (double)llabs(timeerror) / US_PER_NSEC; // 当前DC误差转us
-            double dc_max_us = (double)max_dc_error_ns / US_PER_NSEC;  // 最大DC误差转us
+            double dc_cur_us = (double)llabs(timeerror) / US_PER_NSEC;
+            double dc_max_us = (double)max_dc_error_ns / US_PER_NSEC;
 
             if (total_cycles > 0)
             {
@@ -1028,14 +701,14 @@ void ecatbringup(char *ifname)
                   avg_jitter_us = total_jitter_ns / (total_cycles - 1) / US_PER_NSEC;
 
             printf("\n========== Final Statistics ==========\n");
-            printf("Total cycles    : %" PRId64 "\n", total_cycles);       // 总运行周期数
-            printf("Avg cycle       : %" PRId64 " us\n", avg_cycle_us);    // 平均通讯周期
-            printf("Max cycle       : %" PRId64 " us\n", max_cycle_ns / US_PER_NSEC); // 最大周期
-            printf("Min cycle       : %" PRId64 " us\n", min_cycle_ns / US_PER_NSEC); // 最小周期
-            printf("Avg jitter      : %" PRId64 " us\n", avg_jitter_us);   // 平均周期抖动
-            printf("DC Current Err  : %.2f us\n", dc_cur_us);              // 当前DC同步误差
-            printf("DC Max Err      : %.2f us\n", dc_max_us);               // 最大DC同步误差
-            printf("DC Avg Err      : %.2f us\n", dc_avg_us);               // 平均DC同步误差
+            printf("Total cycles    : %" PRId64 "\n", total_cycles);
+            printf("Avg cycle       : %" PRId64 " us\n", avg_cycle_us);
+            printf("Max cycle       : %" PRId64 " us\n", max_cycle_ns / US_PER_NSEC);
+            printf("Min cycle       : %" PRId64 " us\n", min_cycle_ns / US_PER_NSEC);
+            printf("Avg jitter      : %" PRId64 " us\n", avg_jitter_us);
+            printf("DC Current Err  : %.2f us\n", dc_cur_us);
+            printf("DC Max Err      : %.2f us\n", dc_max_us);
+            printf("DC Avg Err      : %.2f us\n", dc_avg_us);
             printf("======================================\n");
 
             /* Go to SAFE_OP */
@@ -1056,10 +729,10 @@ void ecatbringup(char *ifname)
 
 int main(int argc, char *argv[])
 {
-   printf("SOEM EtherCAT Master with Manual PDO Configuration\n");
+   printf("SOEM EtherCAT Master (Aging Mode, align DCDemo)\n");
    printf("Default cycle time: 1ms\n\n");
 
-   // 全局内存锁定（必须在所有内存分配前执行）
+   // 全局内存锁定
    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
        printf("WARNING: Failed to lock memory (need root privileges). Performance may be degraded.\n");
    } else {
@@ -1073,6 +746,7 @@ int main(int argc, char *argv[])
    mappingdone = 0;
    dorun = 0;
    inOP = 0;
+   memset((void*)&motion_cmd, 0, sizeof(motion_cmd));
 
    // 注册信号处理函数
    signal(SIGINT, signal_handler);
@@ -1089,13 +763,8 @@ int main(int argc, char *argv[])
       osal_thread_create_rt(&threadrt, 128000, &ecatthread, NULL);
       /* create thread to handle slave error handling in OP */
       osal_thread_create(&thread1, 128000, &ecatcheck, NULL);
-      /* create motion control thread */
-      osal_thread_create(&motion_thread, 128000, &motiontask, NULL);
-      /* create CLI thread */
-      osal_thread_create(&cli_thread, 128000, &clitask, NULL);
 
-
-      // ✅ 正确：强制类型转换（把pthread_t*类型的变量转换成pthread_t）
+      // 设置RT线程优先级与名称
       struct sched_param param;
       param.sched_priority = 99;
       if (pthread_setschedparam((pthread_t)threadrt, SCHED_FIFO, &param) != 0) {
@@ -1104,32 +773,16 @@ int main(int argc, char *argv[])
          printf("SUCCESS: RT thread priority set to 99 (SCHED_FIFO)\n");
       }
 
-      // ✅ 正确：强制类型转换
       if (pthread_setname_np((pthread_t)threadrt, "rt_eccomm") != 0) {
          printf("WARNING: Failed to set RT thread name\n");
       } else {
          printf("SUCCESS: RT thread renamed to 'rt_eccomm'\n");
       }
 
-      // ✅ 正确：强制类型转换
       if (pthread_setname_np((pthread_t)thread1, "ec_check") != 0) {
          printf("WARNING: Failed to set error handler thread name\n");
       } else {
-         printf("SUCCESS: RT thread renamed to 'ec_check'\n");
-      }
-
-      // ✅ 正确：强制类型转换
-      if (pthread_setname_np((pthread_t)motion_thread, "motion_thread") != 0) {
-         printf("WARNING: Failed to set motion control thread name\n");
-      } else {
-         printf("SUCCESS: RT thread renamed to 'motion_thread'\n");
-      }
-
-      // ✅ 正确：强制类型转换
-      if (pthread_setname_np((pthread_t)cli_thread, "cli_thread") != 0) {
-         printf("WARNING: Failed to set CLI thread name\n");
-      } else {
-         printf("SUCCESS: RT thread renamed to 'cli_thread'\n");
+         printf("SUCCESS: Error handler thread renamed to 'ec_check'\n");
       }
 
       /* bringup network */
@@ -1139,7 +792,7 @@ int main(int argc, char *argv[])
    {
       ec_adaptert *adapter = NULL;
       ec_adaptert *head = NULL;
-      printf("Usage: ec_sample ifname1 [cycletime]\n");
+      printf("Usage: %s ifname [cycletime]\n", argv[0]);
       printf("ifname = eth0 for example\n");
       printf("cycletime in us\n");
 
