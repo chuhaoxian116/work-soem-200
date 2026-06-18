@@ -43,6 +43,24 @@
 #define ENABLE_OP_SDO_DEBUG          0
 #define ENABLE_CYCLE_DC_TIME_PRINT   0
 
+/*
+ * DC verification policy
+ * ----------------------
+ * Official SOEM DC guidance recommends allowing enough clock-distribution
+ * cycles before OP. At 8ms, 10000 cycles are about 80 seconds.
+ *
+ * This only validates the current baseline behavior:
+ *   SOEM default cyclic frame = LRW(process data) + FRMW(DC system time)
+ *
+ * It does not change PDO mapping, CiA402/CSP control, DC register setup,
+ * or SOEM process-data frame order.
+ */
+#define DC_VERIFY_LIMIT_NS           100000LL   /* 100 us */
+#define DC_VERIFY_STABLE_CYCLES      10000      /* 10000 * 8ms = 80s */
+#define DC_VERIFY_TIMEOUT_MS         120000     /* 120s */
+#define DC_VERIFY_PRINT_EVERY        500        /* 500 * 8ms = 4s */
+#define DC_VERIFY_REQUIRE_PASS       0          /* 1: stop before OP if verification fails */
+
 #define EC_TIMEOUTMON 500
 #define NSEC_PER_SEC  1000000000
 #define US_PER_NSEC   1000
@@ -281,6 +299,324 @@ void debug_read_esc_dc_regs(uint16_t slave, const char *tag)
    }
 
    printf("================================================\n\n");
+}
+
+
+
+/*
+ * Execute a small subset of ENI DC/ESC initialization commands.
+ *
+ * Purpose:
+ *   Test whether the drive depends on ENI-style DC reset/filter/latch
+ *   initialization before ecx_configdc() / ecx_dcsync0().
+ *
+ * This function does NOT configure PDO.
+ * This function does NOT enable Sync0.
+ * This function does NOT replace ecx_configdc() / ecx_dcsync0().
+ *
+ * Call once during startup, before:
+ *   ecx_configdc()
+ *   ecx_dcsync0()
+ *
+ * Do NOT call from the real-time cycle.
+ */
+static void execute_eni_dc_preinit(uint16_t slave)
+{
+   int wkc;
+   uint16_t configadr = ctx.slavelist[slave].configadr;
+
+   printf("\n========== ENI DC/ESC PreInit Test ==========\n");
+   printf("Slave %u configadr = 0x%04X\n", slave, configadr);
+
+   /*
+    * ENI Master InitCmd:
+    *   clear dc system time
+    *   Cmd = BWR, Ado = 2320 = 0x0910, DataLength = 32
+    *
+    * Clear ESC DC system-time related register area before ecx_configdc().
+    */
+   {
+      uint8_t zero32[32] = {0};
+
+      wkc = ecx_BWR(&ctx.port,
+                    0,
+                    0x0910,
+                    sizeof(zero32),
+                    zero32,
+                    EC_TIMEOUTRET3);
+
+      printf("[ENI-DC] BWR  clear dc system time  0x0910 len=32      wkc=%d\n", wkc);
+   }
+
+   /*
+    * ENI Master InitCmd:
+    *   clear dc cycle cfg
+    *   Cmd = BWR, Ado = 2433 = 0x0981, Data = 00
+    *
+    * 0x0981 is the Sync activation byte in the ESC DC activation area.
+    */
+   {
+      uint8_t clear_cycle_cfg = 0x00;
+
+      wkc = ecx_BWR(&ctx.port,
+                    0,
+                    0x0981,
+                    sizeof(clear_cycle_cfg),
+                    &clear_cycle_cfg,
+                    EC_TIMEOUTRET3);
+
+      printf("[ENI-DC] BWR  clear dc cycle cfg    0x0981 data=00     wkc=%d\n", wkc);
+   }
+
+   /*
+    * ENI Master InitCmd:
+    *   reset dc speed
+    *   Cmd = BWR, Ado = 2352 = 0x0930, Data = 00 10
+    *
+    * Keep byte order exactly as ENI frame data.
+    */
+   {
+      uint8_t reset_dc_speed[2] = {0x00, 0x10};
+
+      wkc = ecx_BWR(&ctx.port,
+                    0,
+                    0x0930,
+                    sizeof(reset_dc_speed),
+                    reset_dc_speed,
+                    EC_TIMEOUTRET3);
+
+      printf("[ENI-DC] BWR  reset dc speed        0x0930 data=00 10  wkc=%d\n", wkc);
+   }
+
+   /*
+    * ENI Master InitCmd:
+    *   configure dc filter
+    *   Cmd = BWR, Ado = 2356 = 0x0934, Data = 00 0C
+    *
+    * Keep byte order exactly as ENI frame data.
+    */
+   {
+      uint8_t dc_filter[2] = {0x00, 0x0C};
+
+      wkc = ecx_BWR(&ctx.port,
+                    0,
+                    0x0934,
+                    sizeof(dc_filter),
+                    dc_filter,
+                    EC_TIMEOUTRET3);
+
+      printf("[ENI-DC] BWR  configure dc filter   0x0934 data=00 0C  wkc=%d\n", wkc);
+   }
+
+   /*
+    * ENI Slave InitCmd:
+    *   clear DC activation
+    *   Cmd = FPWR, Ado = 2432 = 0x0980, Data = 00 00
+    *
+    * ecx_dcsync0() will enable Sync0 again later.
+    */
+   {
+      uint8_t clear_dc_activation[2] = {0x00, 0x00};
+
+      wkc = ecx_FPWR(&ctx.port,
+                     configadr,
+                     0x0980,
+                     sizeof(clear_dc_activation),
+                     clear_dc_activation,
+                     EC_TIMEOUTRET3);
+
+      printf("[ENI-DC] FPWR clear DC activation   0x0980 data=00 00  wkc=%d\n", wkc);
+   }
+
+   /*
+    * ENI Slave InitCmd:
+    *   set DC latch cfg
+    *   Cmd = FPWR, Ado = 2472 = 0x09A8, Data = 00 00
+    */
+   {
+      uint8_t dc_latch_cfg[2] = {0x00, 0x00};
+
+      wkc = ecx_FPWR(&ctx.port,
+                     configadr,
+                     0x09A8,
+                     sizeof(dc_latch_cfg),
+                     dc_latch_cfg,
+                     EC_TIMEOUTRET3);
+
+      printf("[ENI-DC] FPWR set DC latch cfg      0x09A8 data=00 00  wkc=%d\n", wkc);
+   }
+
+   printf("========== ENI DC/ESC PreInit Done ==========\n\n");
+}
+
+/*
+ * Execute ENI-style DC Sync0 configuration WITHOUT calling ecx_dcsync0().
+ *
+ * Purpose:
+ *   Test the exact ENI DC activation style:
+ *     0x09A0 = CycleTime0
+ *     0x0990 = 0
+ *     0x0980 = 00 03
+ *     0x09A8 = 00 00
+ *
+ * Difference from ecx_dcsync0():
+ *   - ecx_dcsync0() calculates a future SYNC0 start time and writes 0x0990.
+ *   - ENI writes SYNC0 start time as all zero.
+ *
+ * This function does NOT configure PDO.
+ * This function does NOT replace ecx_configdc().
+ * It is intentionally called AFTER ecx_configdc() and INSTEAD OF ecx_dcsync0().
+ *
+ * Do NOT call from the real-time cycle.
+ */
+static void put_le64_bytes(uint8_t dst[8], uint64_t value)
+{
+   dst[0] = (uint8_t)((value >> 0) & 0xFF);
+   dst[1] = (uint8_t)((value >> 8) & 0xFF);
+   dst[2] = (uint8_t)((value >> 16) & 0xFF);
+   dst[3] = (uint8_t)((value >> 24) & 0xFF);
+   dst[4] = (uint8_t)((value >> 32) & 0xFF);
+   dst[5] = (uint8_t)((value >> 40) & 0xFF);
+   dst[6] = (uint8_t)((value >> 48) & 0xFF);
+   dst[7] = (uint8_t)((value >> 56) & 0xFF);
+}
+
+static bool execute_eni_manual_sync0(uint16_t slave)
+{
+   int wkc;
+   bool ok = true;
+   uint16_t configadr = ctx.slavelist[slave].configadr;
+
+   printf("\n========== ENI Manual Sync0 Test ==========" "\n");
+   printf("Slave %u configadr = 0x%04X\n", slave, configadr);
+   printf("This test does NOT call ecx_dcsync0().\n");
+   printf("It writes ENI-style DC registers directly.\n");
+
+   /*
+    * ENI Slave InitCmd:
+    *   Comment : set DC cycle time
+    *   Cmd     : FPWR
+    *   Adp     : 1001
+    *   Ado     : 2464 = 0x09A0
+    *   Data    : 00 12 7A 00 00 00 00 00 for 8ms
+    *
+    * Use current cycletime so command line cycle argument still works.
+    */
+   {
+      uint8_t dc_cycle_time[8];
+      put_le64_bytes(dc_cycle_time, (uint64_t)cycletime);
+
+      wkc = ecx_FPWR(&ctx.port,
+                     configadr,
+                     0x09A0,
+                     sizeof(dc_cycle_time),
+                     dc_cycle_time,
+                     EC_TIMEOUTRET3);
+
+      printf("[ENI-SYNC0] FPWR set DC cycle time 0x09A0 cycle=%" PRId64 " ns "
+             "raw=%02X %02X %02X %02X %02X %02X %02X %02X wkc=%d\n",
+             cycletime,
+             dc_cycle_time[0], dc_cycle_time[1], dc_cycle_time[2], dc_cycle_time[3],
+             dc_cycle_time[4], dc_cycle_time[5], dc_cycle_time[6], dc_cycle_time[7],
+             wkc);
+
+      if (wkc <= 0) ok = false;
+   }
+
+   /*
+    * ENI Slave InitCmd:
+    *   Comment : set DC start time
+    *   Cmd     : FPWR
+    *   Adp     : 1001
+    *   Ado     : 2448 = 0x0990
+    *   Data    : 00 00 00 00 00 00 00 00
+    *
+    * This is the main difference from ecx_dcsync0().
+    */
+   {
+      uint8_t dc_start_time[8] = {0};
+
+      wkc = ecx_FPWR(&ctx.port,
+                     configadr,
+                     0x0990,
+                     sizeof(dc_start_time),
+                     dc_start_time,
+                     EC_TIMEOUTRET3);
+
+      printf("[ENI-SYNC0] FPWR set DC start time  0x0990 raw=00 00 00 00 00 00 00 00 wkc=%d\n",
+             wkc);
+
+      if (wkc <= 0) ok = false;
+   }
+
+   /*
+    * ENI Slave InitCmd:
+    *   Comment : set DC activation
+    *   Cmd     : FPWR
+    *   Adp     : 1001
+    *   Ado     : 2432 = 0x0980
+    *   Data    : 00 03
+    *
+    * Important byte order:
+    *   raw 0x0980 = 00
+    *   raw 0x0981 = 03
+    * This matches your previous readback where 0x0981 sync activation = 0x03.
+    */
+   {
+      uint8_t dc_activation[2] = {0x00, 0x03};
+
+      wkc = ecx_FPWR(&ctx.port,
+                     configadr,
+                     0x0980,
+                     sizeof(dc_activation),
+                     dc_activation,
+                     EC_TIMEOUTRET3);
+
+      printf("[ENI-SYNC0] FPWR set DC activation  0x0980 data=00 03 wkc=%d\n", wkc);
+
+      if (wkc <= 0) ok = false;
+   }
+
+   /*
+    * ENI Slave InitCmd:
+    *   Comment : set DC latch cfg
+    *   Cmd     : FPWR
+    *   Adp     : 1001
+    *   Ado     : 2472 = 0x09A8
+    *   Data    : 00 00
+    */
+   {
+      uint8_t dc_latch_cfg[2] = {0x00, 0x00};
+
+      wkc = ecx_FPWR(&ctx.port,
+                     configadr,
+                     0x09A8,
+                     sizeof(dc_latch_cfg),
+                     dc_latch_cfg,
+                     EC_TIMEOUTRET3);
+
+      printf("[ENI-SYNC0] FPWR set DC latch cfg   0x09A8 data=00 00 wkc=%d\n", wkc);
+
+      if (wkc <= 0) ok = false;
+   }
+
+   /*
+    * Keep SOEM software-side flags consistent because the RT loop uses:
+    *   ctx.slavelist[i].hasdc
+    *   ctx.slavelist[i].DCactive
+    *   ctx.DCtime from the process-data receive path
+    */
+   if (ok)
+   {
+      ctx.slavelist[slave].DCactive = TRUE;
+      ctx.slavelist[slave].DCcycle = cycletime;
+      ctx.slavelist[slave].DCshift = 0;
+   }
+
+   printf("ENI manual Sync0 result: %s\n", ok ? "OK" : "FAILED");
+   printf("========== ENI Manual Sync0 Done ==========" "\n\n");
+
+   return ok;
 }
 
 
@@ -612,58 +948,150 @@ void debug_read_drive_dc_diag(uint16_t slave, const char *tag)
    printf("=================================================\n\n");
 }
 
+/*
+ * Wait until the master cycle phase is stable relative to the EtherCAT DC time.
+ *
+ * What this verifies:
+ *   - RT process-data cycle is running.
+ *   - WKC is equal to expectedWKC.
+ *   - ec_sync() has pulled the Linux wake-up time close to the requested
+ *     DC phase target: syncoffset = cycle * 2 / 3.
+ *
+ * What this does NOT prove by itself:
+ *   - The drive application layer has accepted CSP/DC synchronization.
+ *     That still needs to be confirmed by 6041 bit12 = 1 and ActualPosition
+ *     following TargetPosition.
+ */
 bool wait_dc_sync_stable(int64_t limit_ns, int stable_cycles, int timeout_ms)
 {
    int stable_cnt = 0;
-   int timeout_cycles = (timeout_ms * 1000000LL) / cycletime;
+   int max_stable_cnt = 0;
+   int valid_samples = 0;
+   int good_samples = 0;
+   int bad_wkc_samples = 0;
+   int over_limit_samples = 0;
+   int64_t max_abs_err = 0;
+   int64_t sum_abs_err = 0;
+   int timeout_cycles = (int)((timeout_ms * 1000000LL) / cycletime);
 
-   printf("\nWait DC sync stable in SAFE_OP: limit=%" PRId64 " ns, need=%d cycles, timeout=%d ms\n",
-          limit_ns, stable_cycles, timeout_ms);
+   printf("\n========== DC SAFE_OP Verification ==========\n");
+   printf("Cycle time        : %" PRId64 " ns\n", cycletime);
+   printf("Sync offset       : %" PRId64 " ns\n", syncoffset);
+   printf("Error limit       : %" PRId64 " ns\n", limit_ns);
+   printf("Need stable       : %d cycles\n", stable_cycles);
+   printf("Timeout           : %d ms (%d cycles)\n", timeout_ms, timeout_cycles);
+   printf("Expected WKC      : %d\n", expectedWKC);
+   printf("=============================================\n");
 
    for (int i = 0; i < timeout_cycles && run; i++)
    {
       osal_usleep(cycletime / 1000);
 
+      /*
+       * Wait until the RT thread has entered the cyclic loop and has received
+       * several frames. Before that, timeerror/wkc may still be stale.
+       */
       if (total_cycles < 10)
       {
          continue;
       }
 
       int64_t abs_err = llabs(timeerror);
+      valid_samples++;
+      sum_abs_err += abs_err;
 
-      if ((wkc == expectedWKC) && (abs_err <= limit_ns))
+      if (abs_err > max_abs_err)
       {
+         max_abs_err = abs_err;
+      }
+
+      if (wkc != expectedWKC)
+      {
+         bad_wkc_samples++;
+         stable_cnt = 0;
+      }
+      else if (abs_err <= limit_ns)
+      {
+         good_samples++;
          stable_cnt++;
+         if (stable_cnt > max_stable_cnt)
+         {
+            max_stable_cnt = stable_cnt;
+         }
       }
       else
       {
+         over_limit_samples++;
          stable_cnt = 0;
       }
 
-      if ((i % 100) == 0)
+      if ((i % DC_VERIFY_PRINT_EVERY) == 0)
       {
-         printf("DC settle: cycle=%" PRId64 ", err=%" PRId64 " ns, stable=%d/%d, wkc=%d/%d\n",
+         int64_t avg_abs_err = valid_samples ? (sum_abs_err / valid_samples) : 0;
+
+         printf("DC verify: cycle=%" PRId64
+                ", err=%" PRId64 " ns"
+                ", abs=%" PRId64 " ns"
+                ", avg_abs=%" PRId64 " ns"
+                ", max_abs=%" PRId64 " ns"
+                ", stable=%d/%d"
+                ", max_stable=%d"
+                ", good=%d/%d"
+                ", wkc=%d/%d"
+                ", bad_wkc=%d"
+                ", over_limit=%d\n",
                 total_cycles,
                 timeerror,
+                abs_err,
+                avg_abs_err,
+                max_abs_err,
                 stable_cnt,
                 stable_cycles,
+                max_stable_cnt,
+                good_samples,
+                valid_samples,
                 wkc,
-                expectedWKC);
+                expectedWKC,
+                bad_wkc_samples,
+                over_limit_samples);
       }
 
       if (stable_cnt >= stable_cycles)
       {
-         printf("DC sync stable OK: err=%" PRId64 " ns, stable=%d cycles\n",
-                timeerror,
-                stable_cnt);
+         int64_t avg_abs_err = valid_samples ? (sum_abs_err / valid_samples) : 0;
+
+         printf("\n========== DC SAFE_OP Verification Result ==========\n");
+         printf("Result            : PASS\n");
+         printf("Final error       : %" PRId64 " ns\n", timeerror);
+         printf("Avg abs error     : %" PRId64 " ns\n", avg_abs_err);
+         printf("Max abs error     : %" PRId64 " ns\n", max_abs_err);
+         printf("Stable cycles     : %d\n", stable_cnt);
+         printf("Max stable cycles : %d\n", max_stable_cnt);
+         printf("Good samples      : %d / %d\n", good_samples, valid_samples);
+         printf("Bad WKC samples   : %d\n", bad_wkc_samples);
+         printf("Over-limit samples: %d\n", over_limit_samples);
+         printf("===================================================\n\n");
          return true;
       }
    }
 
-   printf("WARNING: DC sync not stable enough before OP, last err=%" PRId64 " ns\n",
-          timeerror);
+   int64_t avg_abs_err = valid_samples ? (sum_abs_err / valid_samples) : 0;
+
+   printf("\n========== DC SAFE_OP Verification Result ==========\n");
+   printf("Result            : FAIL\n");
+   printf("Final error       : %" PRId64 " ns\n", timeerror);
+   printf("Avg abs error     : %" PRId64 " ns\n", avg_abs_err);
+   printf("Max abs error     : %" PRId64 " ns\n", max_abs_err);
+   printf("Stable cycles     : %d\n", stable_cnt);
+   printf("Max stable cycles : %d\n", max_stable_cnt);
+   printf("Good samples      : %d / %d\n", good_samples, valid_samples);
+   printf("Bad WKC samples   : %d\n", bad_wkc_samples);
+   printf("Over-limit samples: %d\n", over_limit_samples);
+   printf("===================================================\n\n");
+
    return false;
 }
+
 
 /* Cyclic RT EtherCAT thread */
 OSAL_THREAD_FUNC_RT ecatthread(void)
@@ -720,10 +1148,12 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
          /* ================================
           * DC VALIDATION (IMPORTANT)
           * ================================ */
+#if ENABLE_CYCLE_DC_TIME_PRINT
          if (total_cycles % 1000 == 0)
          {
             printf("DC TIME: %ld ns\n", ctx.DCtime);
          }
+#endif
          // ==============================================
          // EtherCAT 通讯：收上一周期返回帧
          //
@@ -1011,6 +1441,19 @@ void ecatbringup(char *ifname)
 
    /* 3. Configure Distributed Clocks */
 
+   /*
+    * ENI-style DC/ESC reset/filter/latch initialization.
+    *
+    * This intentionally runs before ecx_configdc() and ecx_dcsync0().
+    * It only adds the ENI clear/reset/filter/latch commands that are not
+    * covered by the current manual PDO mapping path.
+    */
+   execute_eni_dc_preinit(slave);
+
+#if ENABLE_STARTUP_ESC_DEBUG
+   debug_read_esc_dc_regs(slave, "after ENI DC preinit, before ecx_configdc");
+#endif
+
    printf("\nConfiguring Distributed Clocks...\n");
    ecx_configdc(&ctx);
 #if ENABLE_STARTUP_ESC_DEBUG
@@ -1023,7 +1466,12 @@ void ecatbringup(char *ifname)
       if (ctx.slavelist[i].hasdc)
       {
          printf("Enable DC Sync0 Slave %d, cycle = %" PRId64 " ns\n", i, cycletime);
-         ecx_dcsync0(&ctx, i, TRUE, cycletime, 0);
+         //ecx_dcsync0(&ctx, i, TRUE, cycletime, 0);
+
+         if (!execute_eni_manual_sync0(i))
+         {
+            printf("ERROR: ENI manual Sync0 configuration failed on slave %d\n", i);
+         }
       }
       else
       {
@@ -1136,8 +1584,43 @@ void ecatbringup(char *ifname)
    mappingdone = 1;
    dorun = 1;
 
-   /* Let RT thread run several cycles in SAFE_OP before OP request */
-   wait_dc_sync_stable(100000, 100, 100000);
+   /*
+    * 7.1 DC verification in SAFE_OP.
+    *
+    * Keep SOEM default cyclic frame unchanged here:
+    *   LRW(process data) + FRMW(DC system time)
+    *
+    * At 8ms, DC_VERIFY_STABLE_CYCLES=10000 means about 80 seconds.
+    * This verifies whether the current SOEM baseline can keep the master
+    * PDO cycle within the requested DC phase window for a long enough time.
+    */
+   bool dc_verify_ok = wait_dc_sync_stable(DC_VERIFY_LIMIT_NS,
+                                           DC_VERIFY_STABLE_CYCLES,
+                                           DC_VERIFY_TIMEOUT_MS);
+
+#if ENABLE_STARTUP_ESC_DEBUG
+   debug_read_esc_dc_regs(slave, "after long SAFE_OP DC verification");
+#endif
+
+#if ENABLE_STARTUP_COE_DC_DIAG
+   debug_read_drive_dc_diag(slave, "after long SAFE_OP DC verification");
+#endif
+
+#if DC_VERIFY_REQUIRE_PASS
+   if (!dc_verify_ok)
+   {
+      printf("ERROR: DC verification failed, stop before OP by policy.\n");
+      dorun = 0;
+      osal_usleep(100000);
+      ecx_close(&ctx);
+      return;
+   }
+#else
+   if (!dc_verify_ok)
+   {
+      printf("WARNING: DC verification failed, continue to OP for observation because DC_VERIFY_REQUIRE_PASS=0.\n");
+   }
+#endif
 
    /*
     * 8. Request OP.
@@ -1366,14 +1849,45 @@ int main(int argc, char *argv[])
 
    if (argc > 2)
    {
-      cycletime = atoi(argv[2]) * 1000;
-   /*
-    * 对齐 Acontis DCDemo:
-    * nCtlSetVal = ((dwBusCycleTimeUsec * 2) / 3) * 1000
-    */
-   syncoffset = (cycletime * 2) / 3;
-      printf("Using custom cycle time: %d us, syncoffset=%" PRId64 " ns\n", atoi(argv[2]), syncoffset);
+      cycletime = (int64_t)atoi(argv[2]) * 1000;
+
+      /*
+       * 默认对齐 Acontis DCDemo / DCM MasterShift：
+       *   nCtlSetVal = ((dwBusCycleTimeUsec * 2) / 3) * 1000
+       */
+      syncoffset = (cycletime * 2) / 3;
    }
+
+   if (argc > 3)
+   {
+      /*
+       * 第三个参数用于扫相位：
+       *   <= 100 : 认为是百分比，例如 20 / 50 / 66.666 / 80
+       *   >  100 : 认为是 ns，例如 5333333
+       */
+      double arg_sync = atof(argv[3]);
+
+      if ((arg_sync >= 0.0) && (arg_sync <= 100.0))
+      {
+         syncoffset = (int64)((double)cycletime * arg_sync / 100.0);
+      }
+      else if (arg_sync > 100.0)
+      {
+         syncoffset = (int64)arg_sync;
+      }
+      else
+      {
+         printf("WARNING: invalid syncoffset argument '%s', keep default 2/3 cycle.\n", argv[3]);
+      }
+
+      if (syncoffset < 0) syncoffset = 0;
+      if (syncoffset >= cycletime) syncoffset = syncoffset % cycletime;
+   }
+
+   printf("Using cycle time: %" PRId64 " us, syncoffset=%" PRId64 " ns (%.3f%% of cycle)\n",
+          cycletime / 1000,
+          syncoffset,
+          ((double)syncoffset * 100.0) / (double)cycletime);
 
    if (argc > 1)
    {
