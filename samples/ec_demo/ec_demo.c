@@ -20,6 +20,29 @@
 
 #include "soem/soem.h"
 
+
+/*
+ * Clean baseline notes
+ * --------------------
+ * This file keeps the current working SOEM application flow unchanged:
+ *   PRE-OP PDO remap -> PDO map -> ESC DC config -> SAFE-OP warmup
+ *   -> OP -> CiA402/CSP command sequence.
+ *
+ * It does NOT implement any SOEM source-level DCM frame reorder test.
+ * Current SOEM cyclic process-data frame is still the default:
+ *   LRW(process data) + FRMW(DC system time).
+ *
+ * Cleanup policy:
+ *   - Keep runtime control logic unchanged.
+ *   - Remove dead/unsafe helper code that is not called.
+ *   - Keep one-shot startup diagnostics behind macros.
+ *   - Disable OP-loop SDO debug by default to avoid mailbox noise during CSP.
+ */
+#define ENABLE_STARTUP_ESC_DEBUG      1
+#define ENABLE_STARTUP_COE_DC_DIAG   1
+#define ENABLE_OP_SDO_DEBUG          0
+#define ENABLE_CYCLE_DC_TIME_PRINT   0
+
 #define EC_TIMEOUTMON 500
 #define NSEC_PER_SEC  1000000000
 #define US_PER_NSEC   1000
@@ -204,23 +227,8 @@ static int esc_read_bytes(uint16_t slave, uint16_t ado, void *buf, uint16_t len)
    return ret;
 }
 
-static int esc_write_bytes(uint16_t slave, uint16_t ado, const void *buf, uint16_t len)
-{
-   uint16_t adp = ctx.slavelist[slave].configadr;
-   int ret = ecx_FPWR(&ctx.port, adp, ado, len, (void *)buf, EC_TIMEOUTRET);
-
-   if (ret <= 0)
-   {
-      printf("ERROR: ESC FPWR failed, slave=%u, ADP=0x%04X, ADO=0x%04X, len=%u, WKC=%d\n",
-             slave, adp, ado, len, ret);
-   }
-
-   return ret;
-}
-
 void debug_read_esc_dc_regs(uint16_t slave, const char *tag)
 {
-   uint8_t b1[1] = {0};
    uint8_t b2[2] = {0};
    uint8_t b4[4] = {0};
    uint8_t b8[8] = {0};
@@ -339,6 +347,12 @@ void signal_handler(int sig)
 
 // ==============================================
 // 核心业务逻辑：状态机 + 老化运动（RT线程内调用，无阻塞）
+//
+// 对齐 DCDemo 的关键点：
+//   1. 先将 TargetPosition 固定到当前 ActualPosition。
+//   2. Enable 过程使用 0x86 -> 0x06 -> 0x07 -> 0x0F。
+//   3. CSP 运动阶段保持 control word = 0x000F，不使用 0x001F。
+//   4. target_velocity / target_torque 保持 0。
 // ==============================================
 void runWork()
 {
@@ -535,6 +549,11 @@ void runWork()
    }
 }
 
+/*
+ * Read drive-side CoE DC diagnostic objects once during startup.
+ * Do not call this from the real-time cycle or OP status loop.
+ * The drive may report values different from ESC registers; this is diagnostic only.
+ */
 void debug_read_drive_dc_diag(uint16_t slave, const char *tag)
 {
    uint16_t sm_sync_type = 0;
@@ -706,7 +725,10 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
             printf("DC TIME: %ld ns\n", ctx.DCtime);
          }
          // ==============================================
-         // EtherCAT 通讯：收帧
+         // EtherCAT 通讯：收上一周期返回帧
+         //
+         // SOEM 默认发送路径仍然是：LRW(process data) + FRMW(DC time)。
+         // 这里不做任何 DCM 帧重排实验。
          // ==============================================
          wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
          dowkccheck = (wkc == expectedWKC) ? 0 : dowkccheck + 1;
@@ -900,38 +922,6 @@ bool configure_pdo(uint16_t slave)
    return true;
 }
 
-bool configure_drive_dc_sync_objects(uint16_t slave)
-{
-   printf("\nConfiguring drive CoE DC sync objects 1C32/1C33...\n");
-
-   uint16_t sync_type = 2;
-   uint32_t sync0_cycle = (uint32_t)cycletime;
-
-   int ok = 1;
-
-   /*
-    * 1C32 = SM output parameter
-    * 1C33 = SM input parameter
-    *
-    * SubIndex 01: Sync mode, rw, PreOP
-    * SubIndex 0A: Sync0 Cycle Time, rw
-    */
-   if (sdo_write(&ctx, slave, 0x1C32, 0x01, &sync_type, sizeof(sync_type)) != 0)
-   {
-      printf("WARNING: write 1C32:01 sync_type=2 failed\n");
-      ok = 0;
-   }
-
-   if (sdo_write(&ctx, slave, 0x1C33, 0x01, &sync_type, sizeof(sync_type)) != 0)
-   {
-      printf("WARNING: write 1C33:01 sync_type=2 failed\n");
-      ok = 0;
-   }
-
-
-   return ok ? true : false;
-}
-
 /* Transition network to operational state */
 void ecatbringup(char *ifname)
 {
@@ -963,8 +953,12 @@ void ecatbringup(char *ifname)
 
    /*
     * 1. PDO remap must be done in PRE_OP.
-    * 注意：先不要写 60C2=1ms。
-    * 这台驱动的 1C32/1C33 实际读回 2ms，必须先读取 SM DC 周期。
+    * Keep this mapping aligned with DCDemo / ENI.
+    *
+    * Do not write 1C32/1C33 here:
+    *   - This drive has shown SAFE_OP errors when forcing SM sync type.
+    *   - ENI startup does not require CoE writes to 1C32/1C33.
+    *   - We only read these objects as diagnostics later.
     */
    if (!configure_pdo(slave))
    {
@@ -974,7 +968,9 @@ void ecatbringup(char *ifname)
 
    /* 2. Map PDO to IOmap */
    ecx_config_map_group(&ctx, IOmap, 0);
+#if ENABLE_STARTUP_ESC_DEBUG
    debug_read_sm_regs(slave, "after ecx_config_map_group");
+#endif
    expectedWKC = (group->outputsWKC * 2) + group->inputsWKC;
 
    printf("\nPDO Mapping Information:\n");
@@ -1017,7 +1013,9 @@ void ecatbringup(char *ifname)
 
    printf("\nConfiguring Distributed Clocks...\n");
    ecx_configdc(&ctx);
+#if ENABLE_STARTUP_ESC_DEBUG
    debug_read_esc_dc_regs(slave, "after ecx_configdc, before dcsync0");
+#endif
 
    /* Enable Sync0 for every DC capable slave */
    for (int i = 1; i <= ctx.slavecount; i++)
@@ -1032,10 +1030,14 @@ void ecatbringup(char *ifname)
          printf("Slave %d has no DC support\n", i);
       }
    }
+#if ENABLE_STARTUP_ESC_DEBUG
    debug_read_esc_dc_regs(slave, "after ecx_dcsync0");
+#endif
 
 
+#if ENABLE_STARTUP_COE_DC_DIAG
    debug_read_drive_dc_diag(slave, "before SAFE_OP");
+#endif
 
    /*
     * 4. Add CoE slaves to cyclic mailbox handler.
@@ -1083,7 +1085,9 @@ void ecatbringup(char *ifname)
    }
 
    printf("SAFE_OP OK\n");
+#if ENABLE_STARTUP_ESC_DEBUG
    debug_read_sm_regs(slave, "after SAFE_OP");
+#endif
 
    /*
     * 6. SAFE_OP 下先交换PDO，读到实际位置。
@@ -1176,7 +1180,9 @@ void ecatbringup(char *ifname)
    inOP = TRUE;
    run = TRUE;
    printf("\nEtherCAT OP OK\n");
+#if ENABLE_STARTUP_ESC_DEBUG
    debug_read_sm_regs(slave, "after OP");
+#endif
    printf("DC status after OP:\n");
    ecx_readstate(&ctx);
    for (int si = 1; si <= ctx.slavecount; si++)
@@ -1188,7 +1194,9 @@ void ecatbringup(char *ifname)
              ctx.slavelist[si].DCactive,
              ctx.slavelist[si].pdelay);
    }
+#if ENABLE_STARTUP_ESC_DEBUG
    debug_read_esc_dc_regs(slave, "after OP");
+#endif
 
    while (run)
    {
@@ -1239,6 +1247,11 @@ void ecatbringup(char *ifname)
          printf("Target Mode      : %d\n", rx_pdo->operation_mode);
       }
 
+#if ENABLE_OP_SDO_DEBUG
+      /*
+       * Optional mailbox debug.
+       * Keep disabled during normal CSP testing to avoid OP-loop SDO traffic.
+       */
       static int32_t sdo_target_position = 0;
       static int32_t sdo_actual_position = 0;
 
@@ -1246,21 +1259,19 @@ void ecatbringup(char *ifname)
       {
          int size = sizeof(sdo_target_position);
          if (ecx_SDOread(&ctx, 1, 0x607A, 0x00, FALSE,
-                        &size, &sdo_target_position, EC_TIMEOUTRXM) > 0)
+                         &size, &sdo_target_position, EC_TIMEOUTRXM) > 0)
          {
             printf("SDO 607A Target Position : %d\n", sdo_target_position);
          }
 
          size = sizeof(sdo_actual_position);
          if (ecx_SDOread(&ctx, 1, 0x6064, 0x00, FALSE,
-                        &size, &sdo_actual_position, EC_TIMEOUTRXM) > 0)
+                         &size, &sdo_actual_position, EC_TIMEOUTRXM) > 0)
          {
             printf("SDO 6064 Actual Position : %d\n", sdo_actual_position);
          }
-
-         printf("PDO 607A Target Position : %d\n", rx_pdo->target_position);
-         printf("PDO 6064 Actual Position : %d\n", tx_pdo->actual_position);
       }
+#endif
 
       printf("\n");
       printf("Current Cycle    : %" PRId64 " us\n", current_cycle_ns / US_PER_NSEC);

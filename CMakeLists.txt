@@ -172,6 +172,7 @@ if(SOEM_BUILD_SAMPLES)
   add_subdirectory(samples/ec_pdoconfig)
   add_subdirectory(samples/ec_communication)
   add_subdirectory(samples/ec_communication_control)
+  add_subdirectory(samples/ec_demo)
 
   if (${CMAKE_SYSTEM_NAME} STREQUAL Linux)
     add_subdirectory(samples/eoe_test)
