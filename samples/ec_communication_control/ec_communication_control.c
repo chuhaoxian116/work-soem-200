@@ -36,11 +36,16 @@
 
 #define EC_TIMEOUTMON 500
 #define NSEC_PER_SEC  1000000000LL
-#define US_PER_NSEC   1000LL
 
 #define DEFAULT_CYCLE_TIME_NS 1000000LL   /* 1 ms */
 #define SAFEOP_WARMUP_CYCLES  300
-#define PRINT_PERIOD_CYCLES   1000
+
+/* Keep these motion constants identical to IGH myproject/app_config.h. */
+#define SINE_RANGE_COUNTS     30000
+#define SINE_PERIOD_NS        10000000000LL
+
+/* Print cumulative communication quality once per minute. */
+#define COMMUNICATION_REPORT_PERIOD_NS 60000000000LL
 
 static uint8 IOmap[4096];
 static ecx_contextt ctx;
@@ -62,13 +67,39 @@ static int64_t cycletime = DEFAULT_CYCLE_TIME_NS;
 static int64_t syncoffset = 0;
 static int64_t timeerror = 0;
 
-/* Basic timing statistics, intentionally small. */
+/*
+ * Communication-quality counters.
+ *
+ * The RT thread owns timing/WKC/DC counters. The check thread updates only the
+ * recovery counters through relaxed atomic operations. A minute report is rare
+ * enough to print directly; any resulting scheduling delay remains visible in
+ * the following cycle instead of being hidden from the quality statistics.
+ */
 static int64_t total_cycles = 0;
 static int64_t last_cycle_ts = 0;
+static int64_t quality_start_ts = 0;
 static int64_t current_cycle_ns = 0;
 static int64_t max_cycle_ns = 0;
 static int64_t min_cycle_ns = INT64_MAX;
+static uint64_t cycle_interval_samples = 0;
+static uint64_t total_cycle_time_ns = 0;
+static uint64_t total_abs_jitter_ns = 0;
+static int64_t max_abs_jitter_ns = 0;
+static uint64_t severe_overruns = 0;
+
+static uint64_t good_wkc_cycles = 0;
+static uint64_t bad_wkc_cycles = 0;
+static uint64_t no_frame_cycles = 0;
+static int min_wkc = INT_MAX;
+static int max_wkc = INT_MIN;
+
 static int64_t max_dc_error_ns = 0;
+static uint64_t dc_valid_samples = 0;
+static uint64_t total_abs_dc_error_ns = 0;
+
+static uint64_t state_error_events = 0;
+static uint64_t reconfiguration_events = 0;
+static uint64_t recovery_events = 0;
 
 typedef struct
 {
@@ -102,6 +133,111 @@ static RxPDO_t *rx_pdo = NULL;
 static TxPDO_t *tx_pdo = NULL;
 static MotionCmd_t motion_cmd;
 
+/*
+ * Print the same core metrics as the IGH implementation so two long-running
+ * tests can be compared directly. The trajectory is a raised cosine:
+ *   target = base + range * (1 - cos(2*pi*t/period)) / 2
+ * Its maximum target-position rate is pi * range / period.
+ */
+static void print_communication_report(const char *title)
+{
+   double elapsed_s = 0.0;
+   double avg_cycle_us = 0.0;
+   double avg_jitter_us = 0.0;
+   double good_percent = 0.0;
+   double avg_dc_us = 0.0;
+   uint64_t state_errors =
+      __atomic_load_n(&state_error_events, __ATOMIC_RELAXED);
+   uint64_t reconfigurations =
+      __atomic_load_n(&reconfiguration_events, __ATOMIC_RELAXED);
+   uint64_t recoveries =
+      __atomic_load_n(&recovery_events, __ATOMIC_RELAXED);
+   int32_t target_position = rx_pdo ? rx_pdo->target_position : 0;
+   int32_t actual_position = tx_pdo ? tx_pdo->actual_position : 0;
+   uint16_t status_word = tx_pdo ? tx_pdo->status_word : 0;
+   double peak_rate = M_PI * (double)SINE_RANGE_COUNTS /
+                      ((double)SINE_PERIOD_NS / (double)NSEC_PER_SEC);
+
+   if (quality_start_ts && last_cycle_ts >= quality_start_ts)
+      elapsed_s = (double)(last_cycle_ts - quality_start_ts) / (double)NSEC_PER_SEC;
+   if (cycle_interval_samples)
+   {
+      avg_cycle_us = (double)total_cycle_time_ns /
+                     (double)cycle_interval_samples / 1000.0;
+      avg_jitter_us = (double)total_abs_jitter_ns /
+                      (double)cycle_interval_samples / 1000.0;
+   }
+   if (total_cycles > 0)
+      good_percent = 100.0 * (double)good_wkc_cycles / (double)total_cycles;
+   if (dc_valid_samples)
+      avg_dc_us = (double)total_abs_dc_error_ns /
+                  (double)dc_valid_samples / 1000.0;
+
+   printf("\n============================================================\n");
+   printf("              SOEM 通信质量报告（%s）\n", title);
+   printf("============================================================\n");
+
+   printf("[运行概况]\n");
+   printf("  运行时长          : %12.3f s\n", elapsed_s);
+   printf("  累计周期          : %12" PRId64 "\n", total_cycles);
+   printf("  标称通信周期      : %12.3f us\n", (double)cycletime / 1000.0);
+
+   printf("[周期质量]\n");
+   printf("  平均实际周期      : %12.3f us\n", avg_cycle_us);
+   printf("  最小 / 最大周期   : %12.3f / %.3f us\n",
+          cycle_interval_samples ? (double)min_cycle_ns / 1000.0 : 0.0,
+          cycle_interval_samples ? (double)max_cycle_ns / 1000.0 : 0.0);
+   printf("  平均绝对抖动      : %12.3f us\n", avg_jitter_us);
+   printf("  最大绝对抖动      : %12.3f us\n",
+          (double)max_abs_jitter_ns / 1000.0);
+   printf("  严重超周期次数    : %12" PRIu64 "  (> 150%% 标称周期)\n",
+          severe_overruns);
+
+   printf("[过程数据报文质量]\n");
+   printf("  期望 WKC          : %12d\n", expectedWKC);
+   printf("  正常 / 异常周期   : %12" PRIu64 " / %" PRIu64 "\n",
+          good_wkc_cycles, bad_wkc_cycles);
+   printf("  无返回帧周期      : %12" PRIu64 "\n", no_frame_cycles);
+   printf("  通信成功率        : %12.6f %%\n", good_percent);
+   printf("  WKC 最小 / 最大   : %12d / %d\n",
+          min_wkc == INT_MAX ? 0 : min_wkc,
+          max_wkc == INT_MIN ? 0 : max_wkc);
+
+   printf("[DC 同步质量]\n");
+   printf("  有效采样数        : %12" PRIu64 "\n", dc_valid_samples);
+   printf("  当前 DC 误差      : %12.3f us\n", (double)timeerror / 1000.0);
+   printf("  平均绝对误差      : %12.3f us\n", avg_dc_us);
+   printf("  最大绝对误差      : %12.3f us\n",
+          (double)max_dc_error_ns / 1000.0);
+
+   printf("[异常与恢复]\n");
+   printf("  状态异常次数      : %12" PRIu64 "\n", state_errors);
+   printf("  重新配置次数      : %12" PRIu64 "\n", reconfigurations);
+   printf("  从站恢复次数      : %12" PRIu64 "\n", recoveries);
+
+   printf("[PDO 与运动状态]\n");
+   printf("  目标位置          : %12d pulse\n", target_position);
+   printf("  实际位置          : %12d pulse\n", actual_position);
+   printf("  位置跟随误差      : %12d pulse\n",
+          target_position - actual_position);
+   printf("  状态字 / bit12    :       0x%04X / %d\n",
+          status_word, (status_word & 0x1000) ? 1 : 0);
+   printf("  模式 / 控制字     : %12d / 0x%04X\n",
+          tx_pdo ? tx_pdo->operation_mode_display : 0,
+          rx_pdo ? rx_pdo->control_word : 0);
+   printf("  目标位置范围      : base ~ base + %d pulse\n", SINE_RANGE_COUNTS);
+   printf("  运动周期          : %12.3f s\n",
+          (double)SINE_PERIOD_NS / (double)NSEC_PER_SEC);
+   printf("  最大目标变化率    : %12.3f pulse/s\n", peak_rate);
+
+   printf("[从站状态]\n");
+   printf("  应用 OP 标志      : %12d\n", inOP);
+   printf("  AL 状态 / 错误码  :       0x%02X / 0x%04X\n",
+          ctx.slavecount > 0 ? ctx.slavelist[1].state : 0,
+          ctx.slavecount > 0 ? ctx.slavelist[1].ALstatuscode : 0);
+   printf("============================================================\n");
+}
+
 static void add_time_ns(ec_timet *ts, int64_t addtime)
 {
    ec_timet addts;
@@ -134,6 +270,8 @@ static void ec_sync(int64 reftime, int64 cycletime_ns, int64 *offsettime)
    int64_t abs_err = llabs(timeerror);
    if (abs_err > max_dc_error_ns)
       max_dc_error_ns = abs_err;
+   dc_valid_samples++;
+   total_abs_dc_error_ns += (uint64_t)abs_err;
 
    integral += timeerror;
    *offsettime = (int64)((timeerror * pgain) + (integral * igain));
@@ -215,8 +353,9 @@ static bool configure_pdo(uint16_t slave)
 }
 
 /*
- * Latest motion/control logic:
- *   0x06 -> 0x07 -> 0x0F -> 10s sine CSP motion
+ * Motion/control logic shared with IGH myproject:
+ *   0x06 -> 0x07 -> 0x0F -> 10 s raised-cosine CSP motion
+ *   target range = [base, base + 30000]
  *   target_velocity = 0
  *   target_torque   = 0
  *   operation_mode  = 8
@@ -238,8 +377,7 @@ static void runWork(void)
    static bool printed[5] = {false};
 
    const uint64_t enable_step_cycles = (uint64_t)(NSEC_PER_SEC / cycletime);
-   const uint64_t sine_period_cycles = (uint64_t)(10000000000LL / cycletime);
-   const int32_t sine_range_counts = 30000;
+   const uint64_t sine_period_cycles = (uint64_t)(SINE_PERIOD_NS / cycletime);
    const double two_pi = 6.28318530717958647692;
 
    if (!tx_pdo || !rx_pdo)
@@ -334,7 +472,7 @@ static void runWork(void)
       case CONTROL_SINE_MOTION:
       {
          double phase = two_pi * (double)motion_cycles / (double)sine_period_cycles;
-         double offset = (1.0 - cos(phase)) * 0.5 * (double)sine_range_counts;
+         double offset = (1.0 - cos(phase)) * 0.5 * (double)SINE_RANGE_COUNTS;
 
          motion_cmd.target_position = sine_base_position + (int32_t)(offset + 0.5);
          motion_cmd.target_velocity = 0;
@@ -371,6 +509,8 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
    ec_timet ts;
    int ht;
    int64_t toff = 0;
+   const uint64_t report_period_cycles =
+      (uint64_t)(COMMUNICATION_REPORT_PERIOD_NS / cycletime);
 
    dorun = 0;
    while (!mappingdone && run)
@@ -387,6 +527,7 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
 
    ecx_send_processdata(&ctx);
    last_cycle_ts = monotonic_raw_ns();
+   quality_start_ts = last_cycle_ts;
 
    while (run)
    {
@@ -400,12 +541,31 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
       current_cycle_ns = now_ns - last_cycle_ts;
       last_cycle_ts = now_ns;
       total_cycles++;
+      cycle_interval_samples++;
+      total_cycle_time_ns += (uint64_t)current_cycle_ns;
+
+      {
+         int64_t abs_jitter_ns = llabs(current_cycle_ns - cycletime);
+         total_abs_jitter_ns += (uint64_t)abs_jitter_ns;
+         if (abs_jitter_ns > max_abs_jitter_ns)
+            max_abs_jitter_ns = abs_jitter_ns;
+      }
 
       if (current_cycle_ns > max_cycle_ns) max_cycle_ns = current_cycle_ns;
       if (current_cycle_ns < min_cycle_ns) min_cycle_ns = current_cycle_ns;
+      if (current_cycle_ns > ((cycletime * 3) / 2)) severe_overruns++;
 
       wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
       dowkccheck = (wkc == expectedWKC) ? 0 : (dowkccheck + 1);
+
+      if (wkc == expectedWKC)
+         good_wkc_cycles++;
+      else
+         bad_wkc_cycles++;
+      if (wkc <= 0)
+         no_frame_cycles++;
+      if (wkc < min_wkc) min_wkc = wkc;
+      if (wkc > max_wkc) max_wkc = wkc;
 
       if (ctx.slavelist[1].hasdc && (wkc > 0))
       {
@@ -425,6 +585,13 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
 
       ecx_mbxhandler(&ctx, 0, 4);
       ecx_send_processdata(&ctx);
+
+      /* One low-frequency cumulative report per wall-clock-equivalent minute. */
+      if (report_period_cycles > 0 &&
+          ((uint64_t)total_cycles % report_period_cycles) == 0)
+      {
+         print_communication_report("每分钟累计");
+      }
    }
 }
 
@@ -436,6 +603,7 @@ OSAL_THREAD_FUNC ecatcheck(void)
    {
       if (inOP && ((dowkccheck > 2) || ctx.grouplist[currentgroup].docheckstate))
       {
+         __atomic_fetch_add(&state_error_events, 1, __ATOMIC_RELAXED);
          ctx.grouplist[currentgroup].docheckstate = FALSE;
          ecx_readstate(&ctx);
 
@@ -461,7 +629,11 @@ OSAL_THREAD_FUNC ecatcheck(void)
                else if (slave->state > EC_STATE_NONE)
                {
                   if (ecx_reconfig_slave(&ctx, slaveix, EC_TIMEOUTMON) >= EC_STATE_PRE_OP)
+                  {
                      slave->islost = FALSE;
+                     __atomic_fetch_add(&reconfiguration_events, 1,
+                                        __ATOMIC_RELAXED);
+                  }
                }
                else if (!slave->islost)
                {
@@ -476,7 +648,10 @@ OSAL_THREAD_FUNC ecatcheck(void)
                if (slave->state <= EC_STATE_INIT)
                {
                   if (ecx_recover_slave(&ctx, slaveix, EC_TIMEOUTMON))
+                  {
                      slave->islost = FALSE;
+                     __atomic_fetch_add(&recovery_events, 1, __ATOMIC_RELAXED);
+                  }
                }
                else
                {
@@ -627,14 +802,12 @@ static bool ecatbringup(char *ifname)
    }
 
    /* Add all CoE slaves to cyclic mailbox handler */
-   int sdoslave = -1;
    for (int si = 1; si <= ctx.slavecount; si++)
    {
       ec_slavet *slave = &ctx.slavelist[si];
       if (slave->CoEdetails > 0)
       {
          ecx_slavembxcyclic(&ctx, si);
-         sdoslave = si;
          printf(" Slave %d added to cyclic mailbox handler\n", si);
       }
    }
@@ -651,27 +824,16 @@ static bool ecatbringup(char *ifname)
    inOP = 1;
 
    printf("OP OK, start CSP control\n");
+   printf("Motion profile: range=[base, base+%d], period=%.3fs, "
+          "peak_target_rate=%.3f pulse/s\n",
+          SINE_RANGE_COUNTS,
+          (double)SINE_PERIOD_NS / (double)NSEC_PER_SEC,
+          M_PI * (double)SINE_RANGE_COUNTS /
+             ((double)SINE_PERIOD_NS / (double)NSEC_PER_SEC));
 
+   /* Periodic reports are emitted by the RT communication thread. */
    while (run)
-   {
-      if ((total_cycles % PRINT_PERIOD_CYCLES) == 0)
-      {
-         uint16_t sw = tx_pdo ? tx_pdo->status_word : 0;
-         printf("cycle=%" PRId64 " wkc=%d/%d sw=0x%04X bit12=%d "
-                "pos=%d target=%d dc_err=%.2fus max_dc=%.2fus\n",
-                total_cycles,
-                wkc,
-                expectedWKC,
-                sw,
-                (sw & 0x1000) ? 1 : 0,
-                tx_pdo ? tx_pdo->actual_position : 0,
-                rx_pdo ? rx_pdo->target_position : 0,
-                (double)timeerror / (double)US_PER_NSEC,
-                (double)max_dc_error_ns / (double)US_PER_NSEC);
-      }
-
       osal_usleep(100000);
-   }
 
    return true;
 }
@@ -706,6 +868,12 @@ int main(int argc, char *argv[])
    if (argc > 2)
       cycletime = (int64_t)atoi(argv[2]) * 1000LL;
 
+   if (cycletime <= 0 || cycletime > SINE_PERIOD_NS)
+   {
+      fprintf(stderr, "cycle_us must be positive and shorter than the motion period\n");
+      return 1;
+   }
+
    printf("SOEM clean API CSP demo, cycle=%" PRId64 " ns\n", cycletime);
 
    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
@@ -733,6 +901,8 @@ int main(int argc, char *argv[])
 
    run = 0;
    osal_usleep(200000);
+   /* RT/check threads have observed run=0; PDO memory is still valid here. */
+   print_communication_report("Ctrl+C 最终汇总");
    shutdown_ethercat();
 
    printf("End program, result=%s\n", ok ? "OK" : "FAILED");
