@@ -29,9 +29,10 @@
  *   PRE-OP PDO remap -> PDO map -> ESC DC config -> SAFE-OP warmup
  *   -> OP -> CiA402/CSP command sequence.
  *
- * Step-4 keeps standard SOEM DC synchronization, but tests a PDO-only LRW
- * length of 28 bytes instead of SOEM's default 29-byte segment. This isolates
- * whether the extra mailbox/status byte affects the drive CSP follow state.
+ * Step-8 keeps the stable standard SOEM 64-bit DC path and PDO-only LRW(28),
+ * but moves DC/SYNC0 initialization before PDO remapping. This follows the
+ * vendor suggestion: configure DC time/synchronization before object-dictionary
+ * PDO configuration, instead of trying to imitate IgH with 32-bit FPWR/FRMW.
  *
  * Cleanup policy:
  *   - Do not gate CSP motion on status-word bit12; match the working IgH demo.
@@ -39,8 +40,8 @@
  *   - Keep one-shot startup diagnostics behind macros.
  *   - Disable OP-loop SDO debug by default to avoid mailbox noise during CSP.
  */
-#define ENABLE_STARTUP_ESC_DEBUG      0
-#define ENABLE_STARTUP_COE_DC_DIAG   0
+#define ENABLE_STARTUP_ESC_DEBUG      1
+#define ENABLE_STARTUP_COE_DC_DIAG   1
 #define ENABLE_OP_SDO_DEBUG          0
 #define ENABLE_CYCLE_DC_TIME_PRINT   0
 #define ENABLE_IGH_REFERENCE_SYNC    0
@@ -56,9 +57,10 @@
  *
  * With ENABLE_PDO_ONLY_LRW_TEST, the cyclic LRW frame excludes SOEM mailbox-status
  * bytes and sends LRW length = Obytes + Ibytes. For your mapping this should be
- * 13 + 15 = 28 bytes, while still using SOEM ec_sync() for DC phase correction.
+ * 13 + 15 = 28 bytes, while still using SOEM ec_sync() with a 64-bit FRMW read.
  *
- * It does not change PDO mapping, CiA402/CSP control, or DC register setup.
+ * Step-8 changes only the startup ordering of DC versus PDO remapping:
+ *   ecx_configdc() / ecx_dcsync0() first, then configure_pdo(), then map PDO.
  */
 #define DC_VERIFY_LIMIT_NS           100000LL   /* 100 us */
 #define DC_VERIFY_STABLE_CYCLES      200
@@ -1908,6 +1910,54 @@ void ecatbringup(char *ifname)
           ctx.slavelist[slave].eep_rev);
 
    /*
+    * Step-8 key experiment: configure DC before PDO object-dictionary writes.
+    *
+    * Vendor feedback: complete DC time/SYNC0 configuration before PDO dictionary
+    * configuration. Keep the proven stable SOEM path: 64-bit FRMW + ec_sync().
+    * Do not hand-write the reference clock every cycle with 32-bit FPWR.
+    */
+
+   /* Optional ENI reset/filter/latch experiment; disabled by default. */
+#if ENABLE_ENI_DC_PREINIT
+   execute_eni_dc_preinit(slave);
+#else
+   printf("ENI DC preinit disabled for Step8 baseline\n");
+#endif
+
+#if ENABLE_STARTUP_ESC_DEBUG
+   debug_read_esc_dc_regs(slave, "Step8 before ecx_configdc, before PDO remap");
+#endif
+
+   printf("\nConfiguring Distributed Clocks before PDO remap...\n");
+   ecx_configdc(&ctx);
+
+#if ENABLE_STARTUP_ESC_DEBUG
+   debug_read_esc_dc_regs(slave, "Step8 after ecx_configdc, before dcsync0, before PDO remap");
+#endif
+
+   for (int i = 1; i <= ctx.slavecount; i++)
+   {
+      if (ctx.slavelist[i].hasdc)
+      {
+         printf("Step8 Enable DC Sync0 Slave %d before PDO remap, cycle = %" PRId64 " ns\n",
+                i, cycletime);
+         ecx_dcsync0(&ctx, i, TRUE, cycletime, 0);
+      }
+      else
+      {
+         printf("Slave %d has no DC support\n", i);
+      }
+   }
+
+#if ENABLE_STARTUP_ESC_DEBUG
+   debug_read_esc_dc_regs(slave, "Step8 after ecx_dcsync0, before PDO remap");
+#endif
+
+#if ENABLE_STARTUP_COE_DC_DIAG
+   debug_read_drive_dc_diag(slave, "Step8 after DC setup, before PDO remap");
+#endif
+
+   /*
     * 1. PDO remap must be done in PRE_OP.
     * Keep this mapping aligned with DCDemo / ENI.
     *
@@ -1965,25 +2015,10 @@ void ecatbringup(char *ifname)
       rx_pdo->operation_mode = 8; /* CSP */
    }
 
-   /* 3. Configure Distributed Clocks */
-
-   /* Optional ENI reset/filter/latch experiment; disabled in the IGH baseline. */
-#if ENABLE_ENI_DC_PREINIT
-   execute_eni_dc_preinit(slave);
-#else
-   printf("ENI DC preinit disabled for IGH-aligned baseline\n");
-#endif
-
-#if ENABLE_STARTUP_ESC_DEBUG
-   debug_read_esc_dc_regs(slave, "after optional ENI DC preinit, before ecx_configdc");
-#endif
-
-   printf("\nConfiguring Distributed Clocks...\n");
-   ecx_configdc(&ctx);
-#if ENABLE_STARTUP_ESC_DEBUG
-   debug_read_esc_dc_regs(slave, "after ecx_configdc, before dcsync0");
-#endif
-
+   /*
+    * 3. DC was already configured before PDO remap in Step-8.
+    * After PDO map, only verify custom LRW path compatibility.
+    */
 #if ENABLE_IGH_REFERENCE_SYNC || ENABLE_PDO_ONLY_LRW_TEST
    {
       uint32_t process_length = group->Obytes + group->Ibytes;
@@ -1993,6 +2028,10 @@ void ecatbringup(char *ifname)
           !process_length || process_length > group->IOsegment[0])
       {
          printf("ERROR: IO mapping is not compatible with the custom LRW test path\n");
+         printf("       blockLRW=%d hasdc=%d DCnext=%u outputs=%p nsegments=%u process_length=%u IOsegment0=%u\n",
+                group->blockLRW, group->hasdc, group->DCnext,
+                (void *)group->outputs, group->nsegments,
+                process_length, group->IOsegment[0]);
          ecx_close(&ctx);
          return;
       }
@@ -2001,7 +2040,7 @@ void ecatbringup(char *ifname)
       printf("IGH reference cyclic frame: FPWR(DC32) + FRMW(DC32) + LRW(%u bytes)\n",
              process_length);
 #else
-      printf("PDO-only LRW test cyclic frame: LRW(%u bytes) + FRMW(DC64)\n",
+      printf("Step8 cyclic frame: LRW(%u bytes) + FRMW(DC64), DC already configured before PDO remap\n",
              process_length);
 #endif
       printf("Mailbox status bytes excluded from LRW: %d\n",
@@ -2009,44 +2048,12 @@ void ecatbringup(char *ifname)
    }
 #endif
 
-   /*
-    * The 0x092C convergence loop is only meaningful for the experimental
-    * IGH-style custom cyclic frame. In the standard SOEM path, keep startup
-    * simple: configdc() -> dcsync0() -> SAFE_OP warmup -> OP.
-    */
-#if ENABLE_IGH_REFERENCE_SYNC
-   if (!wait_dc_start_convergence(slave))
-   {
-      fprintf(stderr, "WARNING: DC 0x092C did not converge before SYNC0 activation, continue for Step-3 observation\n");
-   }
-#else
-#if ENABLE_PDO_ONLY_LRW_TEST
-   printf("PDO-only LRW test path: skip IGH-style 0x092C start convergence\n");
-#else
-   printf("Standard SOEM DC path: skip IGH-style 0x092C start convergence\n");
-#endif
-#endif
-
-   /* Enable Sync0 for every DC capable slave */
-   for (int i = 1; i <= ctx.slavecount; i++)
-   {
-      if (ctx.slavelist[i].hasdc)
-      {
-         printf("Enable DC Sync0 Slave %d, cycle = %" PRId64 " ns\n", i, cycletime);
-         ecx_dcsync0(&ctx, i, TRUE, cycletime, 0);
-      }
-      else
-      {
-         printf("Slave %d has no DC support\n", i);
-      }
-   }
 #if ENABLE_STARTUP_ESC_DEBUG
-   debug_read_esc_dc_regs(slave, "after ecx_dcsync0");
+   debug_read_esc_dc_regs(slave, "Step8 after PDO map, DC should still be active");
 #endif
-
 
 #if ENABLE_STARTUP_COE_DC_DIAG
-   debug_read_drive_dc_diag(slave, "before SAFE_OP");
+   debug_read_drive_dc_diag(slave, "Step8 after PDO map, before SAFE_OP");
 #endif
 
    /* 4. The IGH comparison keeps mailbox traffic out of the PDO cycle. */
@@ -2062,7 +2069,7 @@ void ecatbringup(char *ifname)
 #if ENABLE_IGH_REFERENCE_SYNC
          printf("Slave %d cyclic mailbox handler disabled in IGH reference mode\n", si);
 #elif ENABLE_PDO_ONLY_LRW_TEST
-         printf("Slave %d cyclic mailbox handler disabled in PDO-only LRW test mode\n", si);
+         printf("Slave %d cyclic mailbox handler disabled in Step8 PDO-only LRW test mode\n", si);
 #else
          ecx_slavembxcyclic(&ctx, si);
          printf("Slave %d added to cyclic mailbox handler\n", si);
@@ -2432,11 +2439,11 @@ void ecatbringup(char *ifname)
 
 int main(int argc, char *argv[])
 {
-   printf("SOEM EtherCAT Master (Step5 IgH control clone)\n");
+   printf("SOEM EtherCAT Master (Step8 DC-before-PDO 64bit)\n");
 #if ENABLE_IGH_REFERENCE_SYNC
    printf("Cyclic mode: IGH-style FPWR(DC32) + FRMW(DC32) + LRW(PDO)\n\n");
 #elif ENABLE_PDO_ONLY_LRW_TEST
-   printf("Cyclic mode: Step4 standard DC + PDO-only LRW(28) + FRMW(DC64)\n\n");
+   printf("Cyclic mode: Step8 standard SOEM 64-bit DC + PDO-only LRW(28)\n\n");
 #else
    printf("Cyclic mode: standard SOEM LRW(PDO) + FRMW(DC64)\n\n");
 #endif
@@ -2514,7 +2521,8 @@ int main(int argc, char *argv[])
              cycletime / 1000);
    }
 #elif ENABLE_PDO_ONLY_LRW_TEST
-   printf("PDO-only LRW test is ENABLED: keep SOEM ec_sync(), LRW length = Obytes + Ibytes\n");
+   printf("PDO-only LRW test is ENABLED: SOEM ec_sync() + 64-bit FRMW, LRW length = Obytes + Ibytes\n");
+   printf("Step8 startup order: DC/SYNC0 before PDO remap/config_map\n");
 #endif
 
    if (argc > 1)
