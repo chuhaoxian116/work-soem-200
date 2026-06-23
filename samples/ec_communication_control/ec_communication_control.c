@@ -40,9 +40,20 @@
 #define DEFAULT_CYCLE_TIME_NS 1000000LL   /* 1 ms */
 #define SAFEOP_WARMUP_CYCLES  300
 
-/* Keep these motion constants identical to IGH myproject/app_config.h. */
-#define SINE_RANGE_COUNTS     30000
-#define SINE_PERIOD_NS        10000000000LL
+/*
+ * CSP motion settings; keep the same values in IGH myproject/app_config.h.
+ *
+ * MOTION_RANGE_COUNTS controls travel amplitude relative to the captured base.
+ * MOTION_PEAK_RATE_COUNTS_PER_SEC independently controls the maximum target
+ * position slope. For a 1 ms bus cycle, 50000 pulse/s is about 50 pulse/cycle.
+ * The raised-cosine period is derived automatically from range and peak rate.
+ */
+#define MOTION_RANGE_COUNTS              100000
+#define MOTION_PEAK_RATE_COUNTS_PER_SEC  50000
+#define MOTION_PI_SCALED                 3141592654ULL
+#define MOTION_PERIOD_NS                                                \
+   ((MOTION_PI_SCALED * MOTION_RANGE_COUNTS) /                         \
+    MOTION_PEAK_RATE_COUNTS_PER_SEC)
 
 /* Print cumulative communication quality once per minute. */
 #define COMMUNICATION_REPORT_PERIOD_NS 60000000000LL
@@ -155,8 +166,7 @@ static void print_communication_report(const char *title)
    int32_t target_position = rx_pdo ? rx_pdo->target_position : 0;
    int32_t actual_position = tx_pdo ? tx_pdo->actual_position : 0;
    uint16_t status_word = tx_pdo ? tx_pdo->status_word : 0;
-   double peak_rate = M_PI * (double)SINE_RANGE_COUNTS /
-                      ((double)SINE_PERIOD_NS / (double)NSEC_PER_SEC);
+   double peak_rate = (double)MOTION_PEAK_RATE_COUNTS_PER_SEC;
 
    if (quality_start_ts && last_cycle_ts >= quality_start_ts)
       elapsed_s = (double)(last_cycle_ts - quality_start_ts) / (double)NSEC_PER_SEC;
@@ -225,9 +235,9 @@ static void print_communication_report(const char *title)
    printf("  模式 / 控制字     : %12d / 0x%04X\n",
           tx_pdo ? tx_pdo->operation_mode_display : 0,
           rx_pdo ? rx_pdo->control_word : 0);
-   printf("  目标位置范围      : base ~ base + %d pulse\n", SINE_RANGE_COUNTS);
+   printf("  目标位置范围      : base ~ base + %d pulse\n", MOTION_RANGE_COUNTS);
    printf("  运动周期          : %12.3f s\n",
-          (double)SINE_PERIOD_NS / (double)NSEC_PER_SEC);
+          (double)MOTION_PERIOD_NS / (double)NSEC_PER_SEC);
    printf("  最大目标变化率    : %12.3f pulse/s\n", peak_rate);
 
    printf("[从站状态]\n");
@@ -355,7 +365,7 @@ static bool configure_pdo(uint16_t slave)
 /*
  * Motion/control logic shared with IGH myproject:
  *   0x06 -> 0x07 -> 0x0F -> 10 s raised-cosine CSP motion
- *   target range = [base, base + 30000]
+ *   target range and peak rate are controlled by the macros above
  *   target_velocity = 0
  *   target_torque   = 0
  *   operation_mode  = 8
@@ -377,7 +387,7 @@ static void runWork(void)
    static bool printed[5] = {false};
 
    const uint64_t enable_step_cycles = (uint64_t)(NSEC_PER_SEC / cycletime);
-   const uint64_t sine_period_cycles = (uint64_t)(SINE_PERIOD_NS / cycletime);
+   const uint64_t sine_period_cycles = (uint64_t)(MOTION_PERIOD_NS / cycletime);
    const double two_pi = 6.28318530717958647692;
 
    if (!tx_pdo || !rx_pdo)
@@ -472,7 +482,7 @@ static void runWork(void)
       case CONTROL_SINE_MOTION:
       {
          double phase = two_pi * (double)motion_cycles / (double)sine_period_cycles;
-         double offset = (1.0 - cos(phase)) * 0.5 * (double)SINE_RANGE_COUNTS;
+         double offset = (1.0 - cos(phase)) * 0.5 * (double)MOTION_RANGE_COUNTS;
 
          motion_cmd.target_position = sine_base_position + (int32_t)(offset + 0.5);
          motion_cmd.target_velocity = 0;
@@ -826,10 +836,9 @@ static bool ecatbringup(char *ifname)
    printf("OP OK, start CSP control\n");
    printf("Motion profile: range=[base, base+%d], period=%.3fs, "
           "peak_target_rate=%.3f pulse/s\n",
-          SINE_RANGE_COUNTS,
-          (double)SINE_PERIOD_NS / (double)NSEC_PER_SEC,
-          M_PI * (double)SINE_RANGE_COUNTS /
-             ((double)SINE_PERIOD_NS / (double)NSEC_PER_SEC));
+          MOTION_RANGE_COUNTS,
+          (double)MOTION_PERIOD_NS / (double)NSEC_PER_SEC,
+          (double)MOTION_PEAK_RATE_COUNTS_PER_SEC);
 
    /* Periodic reports are emitted by the RT communication thread. */
    while (run)
@@ -868,7 +877,7 @@ int main(int argc, char *argv[])
    if (argc > 2)
       cycletime = (int64_t)atoi(argv[2]) * 1000LL;
 
-   if (cycletime <= 0 || cycletime > SINE_PERIOD_NS)
+   if (cycletime <= 0 || cycletime > (int64_t)MOTION_PERIOD_NS)
    {
       fprintf(stderr, "cycle_us must be positive and shorter than the motion period\n");
       return 1;
