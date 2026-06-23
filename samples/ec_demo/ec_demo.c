@@ -39,10 +39,10 @@
  *   - Disable OP-loop SDO debug by default to avoid mailbox noise during CSP.
  */
 #define ENABLE_STARTUP_ESC_DEBUG      0
-#define ENABLE_STARTUP_COE_DC_DIAG   0
+#define ENABLE_STARTUP_COE_DC_DIAG   1
 #define ENABLE_OP_SDO_DEBUG          0
 #define ENABLE_CYCLE_DC_TIME_PRINT   0
-#define ENABLE_IGH_REFERENCE_SYNC    0
+#define ENABLE_IGH_REFERENCE_SYNC    1
 #define ENABLE_ENI_DC_PREINIT        0
 #define ENABLE_SAFEOP_DC_PRECHECK     0
 
@@ -221,31 +221,36 @@ void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime)
 }
 
 #if ENABLE_IGH_REFERENCE_SYNC
-static int64_t ethercat_time_now_ns(void)
+static int64_t igh_ec_time_to_ns(const ec_timet *ts)
 {
-   ec_timet now = osal_current_time();
+   return ((int64_t)ts->tv_sec * NSEC_PER_SEC) + ts->tv_nsec;
+}
 
-   return ((int64_t)now.tv_sec - 946684800LL) * NSEC_PER_SEC + now.tv_nsec;
+static void igh_set_application_time_from_ts(const ec_timet *ts)
+{
+   /*
+    * Match the IgH application pattern:
+    *   ecrt_master_application_time(master, wakeup_time_ns)
+    * IgH uses CLOCK_MONOTONIC based wake-up time, not EtherCAT epoch time.
+    * The previous SOEM test generated an independent wall/EtherCAT-epoch based
+    * counter, so the reference-clock FPWR was not phase-locked to the actual
+    * cyclic wake-up instant.
+    */
+   igh_cycle.application_time_ns = igh_ec_time_to_ns(ts);
+   igh_cycle.application_time_valid = true;
 }
 
 static void igh_init_application_time(void)
 {
-   int64_t now = ethercat_time_now_ns();
-   int64_t phase = now % cycletime;
-   int64_t aligned = now - phase + syncoffset;
+   ec_timet now;
 
-   if ((aligned - now) > (cycletime / 2))
-      aligned -= cycletime;
-   else if ((now - aligned) > (cycletime / 2))
-      aligned += cycletime;
+   osal_get_monotonic_time(&now);
+   igh_set_application_time_from_ts(&now);
 
-   igh_cycle.application_time_ns = aligned;
-   igh_cycle.application_time_valid = true;
-
-   printf("IGH reference application time initialized: %" PRId64
+   printf("IGH reference application time initialized from monotonic wake-up time: %" PRId64
           " ns, phase=%" PRId64 " ns\n",
-          aligned,
-          aligned % cycletime);
+          igh_cycle.application_time_ns,
+          igh_cycle.application_time_ns % cycletime);
 }
 
 static int send_igh_processdata(void)
@@ -474,6 +479,9 @@ static bool wait_dc_start_convergence(uint16_t slave)
       add_time_ns(&wakeup_time, cycletime);
       osal_monotonic_sleep(&wakeup_time);
 
+#if ENABLE_IGH_REFERENCE_SYNC
+      igh_set_application_time_from_ts(&wakeup_time);
+#endif
       if (send_cyclic_processdata() > 0)
       {
          (void)receive_cyclic_processdata(EC_TIMEOUTRET);
@@ -1035,10 +1043,17 @@ void runWork()
    static int wait_follow_cnt = 0;
    static int enable_state_cycles = 0;
 
-   /* 保持约 20000 count/s，并让 1 ms/8 ms 参数下的速度一致。 */
-   const int32_t CSP_STEP_PER_CYCLE =
-      (int32_t)((20000LL * cycletime) / NSEC_PER_SEC);
-   const int32_t CSP_MOVE_RANGE     = 100000;
+   /*
+    * Step-2 诊断版：先用小范围、低速度验证驱动是否真的接受 CSP 位置给定。
+    * 之前 1ms 下约 20000 count/s，TargetPosition 已明显变化但 ActualPosition 不跟随；
+    * 这里先降到 2000 count/s、±5000 count，避免诊断阶段给定跳得太大。
+    */
+   const int32_t CSP_SPEED_COUNTS_PER_SEC = 2000;
+   int32_t csp_step_per_cycle =
+      (int32_t)(((int64_t)CSP_SPEED_COUNTS_PER_SEC * cycletime) / NSEC_PER_SEC);
+   if (csp_step_per_cycle < 1) csp_step_per_cycle = 1;
+
+   const int32_t CSP_MOVE_RANGE     = 5000;
    const int     CSP_HOLD_CYCLES    = (int)(NSEC_PER_SEC / cycletime);
    const int     ENABLE_HOLD_CYCLES = (int)(NSEC_PER_SEC / cycletime);
 
@@ -1214,18 +1229,19 @@ void runWork()
 
       case 401:
       {
-         motion_cmd.control_word = 0x000F;   // DCDemo 运动阶段保持 15，即 0x000F
+         motion_cmd.control_word = 0x000F;   // DCDemo / IgH 运动阶段保持 0x000F
          motion_cmd.operation_mode = 8;
-         motion_cmd.target_velocity = 0;
          motion_cmd.target_torque = 0;
 
          if (hold_cycles > 0) {
             hold_cycles--;
             motion_cmd.target_position = csp_target;
+            motion_cmd.target_velocity = 0;
             break;
          }
 
-         csp_target += dir * CSP_STEP_PER_CYCLE;
+         csp_target += dir * csp_step_per_cycle;
+         motion_cmd.target_velocity = dir * CSP_SPEED_COUNTS_PER_SEC;
 
          if (csp_target >= base_pos + CSP_MOVE_RANGE) {
             csp_target = base_pos + CSP_MOVE_RANGE;
@@ -1475,6 +1491,9 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
       ts.tv_sec++;
       ts.tv_nsec -= NSEC_PER_SEC;
    }
+#if ENABLE_IGH_REFERENCE_SYNC
+   igh_set_application_time_from_ts(&ts);
+#endif
    send_cyclic_processdata();
 
    // 初始化单调时钟时间戳
@@ -1554,6 +1573,9 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
 
 #if !ENABLE_IGH_REFERENCE_SYNC
          ecx_mbxhandler(&ctx, 0, 4);
+#endif
+#if ENABLE_IGH_REFERENCE_SYNC
+         igh_set_application_time_from_ts(&ts);
 #endif
          send_cyclic_processdata();
       }
@@ -1857,9 +1879,7 @@ void ecatbringup(char *ifname)
 #if ENABLE_IGH_REFERENCE_SYNC
    if (!wait_dc_start_convergence(slave))
    {
-      fprintf(stderr, "ERROR: DC did not converge before SYNC0 activation\n");
-      ecx_close(&ctx);
-      return;
+      fprintf(stderr, "WARNING: DC 0x092C did not converge before SYNC0 activation, continue for Step-3 observation\n");
    }
 #else
    printf("Standard SOEM DC path: skip IGH-style 0x092C start convergence\n");
@@ -2140,16 +2160,58 @@ void ecatbringup(char *ifname)
        * Optional mailbox debug.
        * Keep disabled during normal CSP testing to avoid OP-loop SDO traffic.
        */
+      static uint16_t sdo_control_word = 0;
+      static uint16_t sdo_status_word = 0;
+      static int8_t sdo_operation_mode = 0;
+      static int8_t sdo_operation_mode_display = 0;
       static int32_t sdo_target_position = 0;
       static int32_t sdo_actual_position = 0;
+      static int32_t sdo_target_velocity = 0;
 
       if (tx_pdo && rx_pdo)
       {
-         int size = sizeof(sdo_target_position);
+         int size;
+
+         size = sizeof(sdo_control_word);
+         if (ecx_SDOread(&ctx, 1, 0x6040, 0x00, FALSE,
+                         &size, &sdo_control_word, EC_TIMEOUTRXM) > 0)
+         {
+            printf("SDO 6040 Control Word    : 0x%04X\n", sdo_control_word);
+         }
+
+         size = sizeof(sdo_status_word);
+         if (ecx_SDOread(&ctx, 1, 0x6041, 0x00, FALSE,
+                         &size, &sdo_status_word, EC_TIMEOUTRXM) > 0)
+         {
+            printf("SDO 6041 Status Word     : 0x%04X\n", sdo_status_word);
+         }
+
+         size = sizeof(sdo_operation_mode);
+         if (ecx_SDOread(&ctx, 1, 0x6060, 0x00, FALSE,
+                         &size, &sdo_operation_mode, EC_TIMEOUTRXM) > 0)
+         {
+            printf("SDO 6060 Operation Mode  : %d\n", sdo_operation_mode);
+         }
+
+         size = sizeof(sdo_operation_mode_display);
+         if (ecx_SDOread(&ctx, 1, 0x6061, 0x00, FALSE,
+                         &size, &sdo_operation_mode_display, EC_TIMEOUTRXM) > 0)
+         {
+            printf("SDO 6061 Mode Display    : %d\n", sdo_operation_mode_display);
+         }
+
+         size = sizeof(sdo_target_position);
          if (ecx_SDOread(&ctx, 1, 0x607A, 0x00, FALSE,
                          &size, &sdo_target_position, EC_TIMEOUTRXM) > 0)
          {
             printf("SDO 607A Target Position : %d\n", sdo_target_position);
+         }
+
+         size = sizeof(sdo_target_velocity);
+         if (ecx_SDOread(&ctx, 1, 0x60FF, 0x00, FALSE,
+                         &size, &sdo_target_velocity, EC_TIMEOUTRXM) > 0)
+         {
+            printf("SDO 60FF Target Velocity : %d\n", sdo_target_velocity);
          }
 
          size = sizeof(sdo_actual_position);
