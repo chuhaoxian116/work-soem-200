@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <math.h>
 
 #include "soem/soem.h"
 
@@ -39,7 +40,7 @@
  *   - Disable OP-loop SDO debug by default to avoid mailbox noise during CSP.
  */
 #define ENABLE_STARTUP_ESC_DEBUG      0
-#define ENABLE_STARTUP_COE_DC_DIAG   1
+#define ENABLE_STARTUP_COE_DC_DIAG   0
 #define ENABLE_OP_SDO_DEBUG          0
 #define ENABLE_CYCLE_DC_TIME_PRINT   0
 #define ENABLE_IGH_REFERENCE_SYNC    0
@@ -1211,231 +1212,185 @@ void signal_handler(int sig)
 // ==============================================
 void runWork()
 {
-   static int step = 0;
-   static bool step_printed[8] = {false};
-
-   static int32_t base_pos = 0;
-   static int32_t csp_target = 0;
-   static int dir = 1;
-   static int hold_cycles = 0;
-   static int wait_follow_cnt = 0;
-   static int enable_state_cycles = 0;
-
    /*
-    * Step-2 诊断版：先用小范围、低速度验证驱动是否真的接受 CSP 位置给定。
-    * 之前 1ms 下约 20000 count/s，TargetPosition 已明显变化但 ActualPosition 不跟随；
-    * 这里先降到 2000 count/s、±5000 count，避免诊断阶段给定跳得太大。
+    * Step-5: clone the working IgH demo control behaviour as closely as possible.
+    *
+    * IgH demo behaviour from uploaded source/capture:
+    *   - mapped RxPDO still contains 607A, 60FF, 6040, 6071, 6060
+    *   - application only writes 607A, 6040, 6060
+    *   - 60FF target velocity and 6071 target torque remain 0
+    *   - no 0x0086 fault-reset pulse in the normal enable path
+    *   - 0x0006 -> hold 1s -> 0x0007 -> hold 1s -> 0x000F -> hold 1s
+    *   - during all enable/hold stages, TargetPosition follows ActualPosition
+    *   - after enable, use smooth sine target: base -> base + 30000 -> base over 10s
     */
-   const int32_t CSP_SPEED_COUNTS_PER_SEC = 2000;
-   int32_t csp_step_per_cycle =
-      (int32_t)(((int64_t)CSP_SPEED_COUNTS_PER_SEC * cycletime) / NSEC_PER_SEC);
-   if (csp_step_per_cycle < 1) csp_step_per_cycle = 1;
+   enum {
+      CONTROL_WAIT_STATUS = 0,
+      CONTROL_ENABLE_06,
+      CONTROL_ENABLE_07,
+      CONTROL_ENABLE_15,
+      CONTROL_SINE_MOTION,
+   };
 
-   const int32_t CSP_MOVE_RANGE     = 5000;
-   const int     CSP_HOLD_CYCLES    = (int)(NSEC_PER_SEC / cycletime);
-   const int     ENABLE_HOLD_CYCLES = (int)(NSEC_PER_SEC / cycletime);
+   static int control_state = CONTROL_WAIT_STATUS;
+   static uint64_t control_state_cycles = 0;
+   static uint64_t motion_cycles = 0;
+   static int32_t sine_base_position = 0;
+   static bool printed[5] = {false};
+
+   const uint64_t ENABLE_STEP_CYCLES = (uint64_t)(NSEC_PER_SEC / cycletime);  /* 1s at current cycle */
+   const uint64_t SINE_PERIOD_CYCLES = (uint64_t)(10000000000LL / cycletime); /* 10s */
+   const int32_t SINE_RANGE_COUNTS = 30000;
+   const double TWO_PI_LOCAL = 6.28318530717958647692;
 
    uint16_t sw = tx_pdo ? tx_pdo->status_word : 0;
 
-   switch (step)
+   if (!tx_pdo || !rx_pdo)
    {
-      case 0:
-      {
-         /*
-          * DCDemo 的关键点：先把目标位置固定为当前实际位置。
-          * 后续 0x06 / 0x07 / 0x0F 阶段不要每周期改成 actual_position，
-          * 否则目标会跟着反馈抖动，不完全等价于 DCDemo。
-          */
-         base_pos = tx_pdo->actual_position;
-         csp_target = base_pos;
+      return;
+   }
 
-         motion_cmd.control_word = 0x0086;
-         motion_cmd.operation_mode = 8;
-         motion_cmd.target_position = csp_target;
+   /* Match IgH: if no valid status yet, keep outputs safe. */
+   if (sw == 0)
+   {
+      motion_cmd.target_position = tx_pdo->actual_position;
+      motion_cmd.target_velocity = 0;
+      motion_cmd.control_word = 0x0000;
+      motion_cmd.target_torque = 0;
+      motion_cmd.operation_mode = 8;
+      return;
+   }
+
+   switch (control_state)
+   {
+      case CONTROL_WAIT_STATUS:
+      {
+         motion_cmd.target_position = tx_pdo->actual_position;
          motion_cmd.target_velocity = 0;
-         motion_cmd.target_torque = 0;
-
-         if (!step_printed[0]) {
-            step_printed[0] = true;
-            printf("[Step 0] Fault reset sent, CW:0x%04X, SW:0x%04X, fixed target:%d, mode:%d\n",
-                   motion_cmd.control_word,
-                   sw,
-                   csp_target,
-                   tx_pdo->operation_mode_display);
-         }
-
-         enable_state_cycles = 0;
-         step = 100;
-      }
-      break;
-
-      case 100:
-      {
          motion_cmd.control_word = 0x0006;
-         motion_cmd.operation_mode = 8;
-         motion_cmd.target_position = csp_target;
-         motion_cmd.target_velocity = 0;
          motion_cmd.target_torque = 0;
-
-         enable_state_cycles++;
-         if (((sw & 0x006F) == 0x0021) &&
-             (enable_state_cycles >= ENABLE_HOLD_CYCLES)) {
-            if (!step_printed[1]) {
-               step_printed[1] = true;
-               printf("[Step 100] Ready to switch on, CW:0x%04X, SW:0x%04X, fixed target:%d, pos:%d, mode:%d\n",
-                      motion_cmd.control_word,
-                      sw,
-                      csp_target,
-                      tx_pdo->actual_position,
-                      tx_pdo->operation_mode_display);
-            }
-            enable_state_cycles = 0;
-            step = 200;
-         }
-      }
-      break;
-
-      case 200:
-      {
-         motion_cmd.control_word = 0x0007;
          motion_cmd.operation_mode = 8;
-         motion_cmd.target_position = csp_target;
-         motion_cmd.target_velocity = 0;
-         motion_cmd.target_torque = 0;
 
-         enable_state_cycles++;
-         if (((sw & 0x006F) == 0x0023) &&
-             (enable_state_cycles >= ENABLE_HOLD_CYCLES)) {
-            if (!step_printed[2]) {
-               step_printed[2] = true;
-               printf("[Step 200] Switched on, CW:0x%04X, SW:0x%04X, fixed target:%d, pos:%d, mode:%d\n",
-                      motion_cmd.control_word,
-                      sw,
-                      csp_target,
-                      tx_pdo->actual_position,
-                      tx_pdo->operation_mode_display);
-            }
-            enable_state_cycles = 0;
-            step = 300;
-         }
-      }
-      break;
-
-      case 300:
-      {
-         motion_cmd.control_word = 0x000F;
-         motion_cmd.operation_mode = 8;
-         motion_cmd.target_position = csp_target;
-         motion_cmd.target_velocity = 0;
-         motion_cmd.target_torque = 0;
-
-         bool operation_enabled = ((sw & 0x006F) == 0x0027);
-
-         /*
-          * 对齐已经能正常运动的 IgH demo：
-          *   0x000F 保持固定周期后进入运动；
-          *   6041 bit12 只作为观察信息打印，不作为进入运动的硬条件。
-          *
-          * 你的日志中 SW=0x0637 已经表示 Operation enabled，
-          * 但 bit12 一直为 0，原逻辑会永久卡在 Step 300。
-          */
-         if (operation_enabled)
+         if (!printed[0])
          {
-            enable_state_cycles++;
-
-            if (enable_state_cycles >= ENABLE_HOLD_CYCLES)
-            {
-               if (!step_printed[3])
-               {
-                  step_printed[3] = true;
-                  printf("[Step 300] Operation enabled, CW:0x%04X, SW:0x%04X, bit12=%d, fixed target:%d, pos:%d, mode:%d\n",
-                         motion_cmd.control_word,
-                         sw,
-                         (sw & 0x1000) ? 1 : 0,
-                         csp_target,
-                         tx_pdo->actual_position,
-                         tx_pdo->operation_mode_display);
-               }
-
-               enable_state_cycles = 0;
-               step = 400;
-            }
-         }
-         else
-         {
-            enable_state_cycles = 0;
-
-            if ((wait_follow_cnt++ % 1000) == 0)
-            {
-               printf("[Step 300] waiting operation enabled, CW:0x%04X, SW:0x%04X, op_en=%d, bit12=%d, target:%d, pos:%d\n",
-                      motion_cmd.control_word,
-                      sw,
-                      operation_enabled ? 1 : 0,
-                      (sw & 0x1000) ? 1 : 0,
-                      csp_target,
-                      tx_pdo->actual_position);
-            }
-         }
-      }
-      break;
-
-      case 400:
-      {
-         /* 真正开始运动前，再以当前实际位置作为往复中心。 */
-         base_pos = tx_pdo->actual_position;
-         csp_target = base_pos;
-         dir = 1;
-         hold_cycles = CSP_HOLD_CYCLES;
-
-         motion_cmd.control_word = 0x000F;
-         motion_cmd.operation_mode = 8;
-         motion_cmd.target_position = csp_target;
-         motion_cmd.target_velocity = 0;
-         motion_cmd.target_torque = 0;
-
-         if (!step_printed[4]) {
-            step_printed[4] = true;
-            printf("[Step 400] CSP motion armed, CW:0x%04X, SW:0x%04X, base:%d, mode:%d\n",
-                   motion_cmd.control_word,
-                   sw,
-                   base_pos,
+            printed[0] = true;
+            printf("[IgH Step] WAIT_STATUS -> ENABLE_06, CW=0x%04X, SW=0x%04X, target=actual=%d, mode=%d\n",
+                   motion_cmd.control_word, sw, motion_cmd.target_position,
                    tx_pdo->operation_mode_display);
          }
-         step = 401;
+
+         control_state_cycles = 0;
+         control_state = CONTROL_ENABLE_06;
       }
       break;
 
-      case 401:
+      case CONTROL_ENABLE_06:
       {
-         motion_cmd.control_word = 0x000F;   // DCDemo / IgH 运动阶段保持 0x000F
-         motion_cmd.operation_mode = 8;
+         motion_cmd.target_position = tx_pdo->actual_position;
+         motion_cmd.target_velocity = 0;
+         motion_cmd.control_word = 0x0006;
          motion_cmd.target_torque = 0;
+         motion_cmd.operation_mode = 8;
 
-         if (hold_cycles > 0) {
-            hold_cycles--;
-            motion_cmd.target_position = csp_target;
-            motion_cmd.target_velocity = 0;
-            break;
+         if (++control_state_cycles >= ENABLE_STEP_CYCLES)
+         {
+            if (!printed[1])
+            {
+               printed[1] = true;
+               printf("[IgH Step] ENABLE_06 -> ENABLE_07, CW=0x%04X, SW=0x%04X, target=actual=%d, mode=%d\n",
+                      motion_cmd.control_word, sw, motion_cmd.target_position,
+                      tx_pdo->operation_mode_display);
+            }
+            control_state_cycles = 0;
+            control_state = CONTROL_ENABLE_07;
+         }
+      }
+      break;
+
+      case CONTROL_ENABLE_07:
+      {
+         motion_cmd.target_position = tx_pdo->actual_position;
+         motion_cmd.target_velocity = 0;
+         motion_cmd.control_word = 0x0007;
+         motion_cmd.target_torque = 0;
+         motion_cmd.operation_mode = 8;
+
+         if (++control_state_cycles >= ENABLE_STEP_CYCLES)
+         {
+            if (!printed[2])
+            {
+               printed[2] = true;
+               printf("[IgH Step] ENABLE_07 -> ENABLE_15, CW=0x%04X, SW=0x%04X, target=actual=%d, mode=%d\n",
+                      motion_cmd.control_word, sw, motion_cmd.target_position,
+                      tx_pdo->operation_mode_display);
+            }
+            control_state_cycles = 0;
+            control_state = CONTROL_ENABLE_15;
+         }
+      }
+      break;
+
+      case CONTROL_ENABLE_15:
+      {
+         motion_cmd.target_position = tx_pdo->actual_position;
+         motion_cmd.target_velocity = 0;
+         motion_cmd.control_word = 0x000F;
+         motion_cmd.target_torque = 0;
+         motion_cmd.operation_mode = 8;
+
+         if (++control_state_cycles >= ENABLE_STEP_CYCLES)
+         {
+            sine_base_position = tx_pdo->actual_position;
+            motion_cycles = 0;
+
+            if (!printed[3])
+            {
+               printed[3] = true;
+               printf("[IgH Step] ENABLE_15 -> SINE_MOTION, CW=0x%04X, SW=0x%04X, bit12=%d, base=%d, mode=%d\n",
+                      motion_cmd.control_word, sw, (sw & 0x1000) ? 1 : 0,
+                      sine_base_position, tx_pdo->operation_mode_display);
+            }
+            control_state_cycles = 0;
+            control_state = CONTROL_SINE_MOTION;
+         }
+      }
+      break;
+
+      case CONTROL_SINE_MOTION:
+      {
+         double phase = TWO_PI_LOCAL * (double)motion_cycles / (double)SINE_PERIOD_CYCLES;
+         double offset = (1.0 - cos(phase)) * 0.5 * (double)SINE_RANGE_COUNTS;
+
+         motion_cmd.target_position = sine_base_position + (int32_t)(offset + 0.5);
+         motion_cmd.target_velocity = 0;
+         motion_cmd.control_word = 0x000F;
+         motion_cmd.target_torque = 0;
+         motion_cmd.operation_mode = 8;
+
+         if (!printed[4])
+         {
+            printed[4] = true;
+            printf("[IgH Step] SINE_MOTION started, CW=0x%04X, SW=0x%04X, bit12=%d, base=%d\n",
+                   motion_cmd.control_word, sw, (sw & 0x1000) ? 1 : 0,
+                   sine_base_position);
          }
 
-         csp_target += dir * csp_step_per_cycle;
-         motion_cmd.target_velocity = dir * CSP_SPEED_COUNTS_PER_SEC;
-
-         if (csp_target >= base_pos + CSP_MOVE_RANGE) {
-            csp_target = base_pos + CSP_MOVE_RANGE;
-            dir = -1;
-         } else if (csp_target <= base_pos - CSP_MOVE_RANGE) {
-            csp_target = base_pos - CSP_MOVE_RANGE;
-            dir = 1;
-         }
-
-         motion_cmd.target_position = csp_target;
+         motion_cycles = (motion_cycles + 1) % SINE_PERIOD_CYCLES;
       }
       break;
 
       default:
-         step = 0;
-         break;
+      {
+         control_state = CONTROL_WAIT_STATUS;
+         control_state_cycles = 0;
+         motion_cycles = 0;
+         motion_cmd.target_position = tx_pdo->actual_position;
+         motion_cmd.target_velocity = 0;
+         motion_cmd.control_word = 0x0000;
+         motion_cmd.target_torque = 0;
+         motion_cmd.operation_mode = 8;
+      }
+      break;
    }
 }
 
@@ -2477,7 +2432,7 @@ void ecatbringup(char *ifname)
 
 int main(int argc, char *argv[])
 {
-   printf("SOEM EtherCAT Master (IGH-aligned CSP baseline)\n");
+   printf("SOEM EtherCAT Master (Step5 IgH control clone)\n");
 #if ENABLE_IGH_REFERENCE_SYNC
    printf("Cyclic mode: IGH-style FPWR(DC32) + FRMW(DC32) + LRW(PDO)\n\n");
 #elif ENABLE_PDO_ONLY_LRW_TEST
