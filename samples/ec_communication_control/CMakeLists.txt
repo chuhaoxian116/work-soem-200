@@ -1,3 +1,3 @@
 add_executable(ec_communication_control ec_communication_control.c)
-target_link_libraries(ec_communication_control soem)
+target_link_libraries(ec_communication_control soem m)
 install(TARGETS ec_communication_control DESTINATION bin)
