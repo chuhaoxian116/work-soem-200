@@ -28,9 +28,9 @@
  *   PRE-OP PDO remap -> PDO map -> ESC DC config -> SAFE-OP warmup
  *   -> OP -> CiA402/CSP command sequence.
  *
- * The optional IGH reference-clock test keeps all changes in this demo and
- * sends one cyclic frame in the order observed in the IGH capture:
- *   FPWR(DC system time low 32 bits) + FRMW(DC time low 32 bits) + LRW(PDO).
+ * Step-4 keeps standard SOEM DC synchronization, but tests a PDO-only LRW
+ * length of 28 bytes instead of SOEM's default 29-byte segment. This isolates
+ * whether the extra mailbox/status byte affects the drive CSP follow state.
  *
  * Cleanup policy:
  *   - Do not gate CSP motion on status-word bit12; match the working IgH demo.
@@ -42,7 +42,8 @@
 #define ENABLE_STARTUP_COE_DC_DIAG   1
 #define ENABLE_OP_SDO_DEBUG          0
 #define ENABLE_CYCLE_DC_TIME_PRINT   0
-#define ENABLE_IGH_REFERENCE_SYNC    1
+#define ENABLE_IGH_REFERENCE_SYNC    0
+#define ENABLE_PDO_ONLY_LRW_TEST      1
 #define ENABLE_ENI_DC_PREINIT        0
 #define ENABLE_SAFEOP_DC_PRECHECK     0
 
@@ -52,9 +53,9 @@
  * Allow enough clock-distribution cycles before OP. The elapsed verification
  * time is DC_VERIFY_STABLE_CYCLES multiplied by the selected master cycle.
  *
- * With ENABLE_IGH_REFERENCE_SYNC, the cyclic PDO frame excludes SOEM mailbox-status
+ * With ENABLE_PDO_ONLY_LRW_TEST, the cyclic LRW frame excludes SOEM mailbox-status
  * bytes and sends LRW length = Obytes + Ibytes. For your mapping this should be
- * 13 + 15 = 28 bytes, matching the IGH capture.
+ * 13 + 15 = 28 bytes, while still using SOEM ec_sync() for DC phase correction.
  *
  * It does not change PDO mapping, CiA402/CSP control, or DC register setup.
  */
@@ -438,6 +439,181 @@ static int receive_cyclic_processdata(int timeout)
    return receive_igh_processdata(timeout);
 }
 #else
+
+#if ENABLE_PDO_ONLY_LRW_TEST
+typedef struct
+{
+   int pending_idx;
+   uint16_t lrw_data_offset;
+   uint16_t lrw_wkc_offset;
+   uint16_t frmw_data_offset;
+   uint16_t frmw_wkc_offset;
+   uint16_t process_length;
+} PdoOnlyLrwCycleState_t;
+
+static PdoOnlyLrwCycleState_t pdo_lrw_cycle = {
+   .pending_idx = -1
+};
+
+static uint64_t read_le64_unaligned(const uint8_t *p)
+{
+   return ((uint64_t)p[0]) |
+          ((uint64_t)p[1] << 8) |
+          ((uint64_t)p[2] << 16) |
+          ((uint64_t)p[3] << 24) |
+          ((uint64_t)p[4] << 32) |
+          ((uint64_t)p[5] << 40) |
+          ((uint64_t)p[6] << 48) |
+          ((uint64_t)p[7] << 56);
+}
+
+/*
+ * Step-4 test path:
+ *   - Keep standard SOEM DC closed loop in the RT thread:
+ *       ec_sync(ctx.DCtime, cycletime, &toff)
+ *   - Do NOT write the DC system time every cycle with FPWR.
+ *   - Only change one variable compared with standard SOEM process data:
+ *       LRW length = Obytes + Ibytes = 13 + 15 = 28 bytes
+ *     instead of SOEM segment length that may include one mailbox/status byte.
+ *
+ * Cyclic frame expected in capture:
+ *   LRW(PDO 28 bytes) + FRMW(DC system time 64-bit)
+ */
+static int send_pdo_only_lrw_processdata(void)
+{
+   ec_groupt *group = &ctx.grouplist[currentgroup];
+   uint64_t dc_time_zero = 0;
+   uint32_t log_addr;
+   uint16_t w1;
+   uint16_t w2;
+   uint16_t process_length;
+   uint16_t dc_slave;
+   uint8_t idx;
+
+   if (pdo_lrw_cycle.pending_idx >= 0)
+   {
+      return 0;
+   }
+
+   if (group->blockLRW || !group->hasdc || !group->DCnext)
+   {
+      return 0;
+   }
+
+   process_length = (uint16_t)(group->Obytes + group->Ibytes);
+   if (!process_length || !group->outputs ||
+       !group->nsegments || process_length > group->IOsegment[0])
+   {
+      return 0;
+   }
+
+   if (group->mbxstatus && group->mbxstatuslength)
+   {
+      memset(group->mbxstatus, 0, group->mbxstatuslength);
+   }
+
+   dc_slave = ctx.slavelist[group->DCnext].configadr;
+   log_addr = group->logstartaddr;
+   w1 = LO_WORD(log_addr);
+   w2 = HI_WORD(log_addr);
+   idx = ecx_getindex(&ctx.port);
+
+   ecx_setupdatagram(&ctx.port, &ctx.port.txbuf[idx],
+                     EC_CMD_LRW, idx, w1, w2,
+                     process_length, group->outputs);
+   pdo_lrw_cycle.lrw_data_offset = EC_HEADERSIZE;
+   pdo_lrw_cycle.lrw_wkc_offset =
+      pdo_lrw_cycle.lrw_data_offset + process_length;
+
+   pdo_lrw_cycle.frmw_data_offset =
+      ecx_adddatagram(&ctx.port, &ctx.port.txbuf[idx],
+                      EC_CMD_FRMW, idx, FALSE,
+                      dc_slave, ECT_REG_DCSYSTIME,
+                      sizeof(dc_time_zero), &dc_time_zero);
+   pdo_lrw_cycle.frmw_wkc_offset =
+      pdo_lrw_cycle.frmw_data_offset + sizeof(dc_time_zero);
+
+   pdo_lrw_cycle.process_length = process_length;
+
+   if (ecx_outframe_red(&ctx.port, idx) <= 0)
+   {
+      ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+      return 0;
+   }
+
+   pdo_lrw_cycle.pending_idx = idx;
+   return 1;
+}
+
+static int receive_pdo_only_lrw_processdata(int timeout)
+{
+   ec_groupt *group = &ctx.grouplist[currentgroup];
+   uint8_t *rxbuf;
+   uint16_t le_wkc;
+   uint16_t lrw_wkc;
+   uint16_t frmw_wkc;
+   uint8_t idx;
+   int frame_wkc;
+
+   if (pdo_lrw_cycle.pending_idx < 0)
+   {
+      return EC_NOFRAME;
+   }
+
+   idx = (uint8_t)pdo_lrw_cycle.pending_idx;
+   frame_wkc = ecx_waitinframe(&ctx.port, idx, timeout);
+   if (frame_wkc <= EC_NOFRAME)
+   {
+      ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+      pdo_lrw_cycle.pending_idx = -1;
+      return EC_NOFRAME;
+   }
+
+   rxbuf = ctx.port.rxbuf[idx];
+   if (rxbuf[EC_CMDOFFSET] != EC_CMD_LRW)
+   {
+      ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+      pdo_lrw_cycle.pending_idx = -1;
+      return EC_NOFRAME;
+   }
+
+   memcpy(group->outputs,
+          &rxbuf[pdo_lrw_cycle.lrw_data_offset],
+          pdo_lrw_cycle.process_length);
+
+   memcpy(&le_wkc,
+          &rxbuf[pdo_lrw_cycle.lrw_wkc_offset],
+          sizeof(le_wkc));
+   lrw_wkc = etohs(le_wkc);
+
+   memcpy(&le_wkc,
+          &rxbuf[pdo_lrw_cycle.frmw_wkc_offset],
+          sizeof(le_wkc));
+   frmw_wkc = etohs(le_wkc);
+
+   ctx.DCtime =
+      (int64_t)read_le64_unaligned(&rxbuf[pdo_lrw_cycle.frmw_data_offset]);
+
+   if ((frmw_wkc != 1) && ((total_cycles % 1000) == 0))
+   {
+      printf("PDO-only LRW DC datagram WKC mismatch: FRMW=%u\n", frmw_wkc);
+   }
+
+   ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+   pdo_lrw_cycle.pending_idx = -1;
+   return lrw_wkc;
+}
+
+static int send_cyclic_processdata(void)
+{
+   return send_pdo_only_lrw_processdata();
+}
+
+static int receive_cyclic_processdata(int timeout)
+{
+   return receive_pdo_only_lrw_processdata(timeout);
+}
+#else
 static int send_cyclic_processdata(void)
 {
    return ecx_send_processdata(&ctx);
@@ -447,6 +623,8 @@ static int receive_cyclic_processdata(int timeout)
 {
    return ecx_receive_processdata(&ctx, timeout);
 }
+#endif
+
 #endif
 
 /*
@@ -1571,7 +1749,7 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
             rx_pdo->operation_mode = motion_cmd.operation_mode;
          }
 
-#if !ENABLE_IGH_REFERENCE_SYNC
+#if !ENABLE_IGH_REFERENCE_SYNC && !ENABLE_PDO_ONLY_LRW_TEST
          ecx_mbxhandler(&ctx, 0, 4);
 #endif
 #if ENABLE_IGH_REFERENCE_SYNC
@@ -1851,7 +2029,7 @@ void ecatbringup(char *ifname)
    debug_read_esc_dc_regs(slave, "after ecx_configdc, before dcsync0");
 #endif
 
-#if ENABLE_IGH_REFERENCE_SYNC
+#if ENABLE_IGH_REFERENCE_SYNC || ENABLE_PDO_ONLY_LRW_TEST
    {
       uint32_t process_length = group->Obytes + group->Ibytes;
 
@@ -1859,13 +2037,18 @@ void ecatbringup(char *ifname)
           !group->outputs || !group->nsegments ||
           !process_length || process_length > group->IOsegment[0])
       {
-         printf("ERROR: IO mapping is not compatible with the single-frame IGH reference path\n");
+         printf("ERROR: IO mapping is not compatible with the custom LRW test path\n");
          ecx_close(&ctx);
          return;
       }
 
+#if ENABLE_IGH_REFERENCE_SYNC
       printf("IGH reference cyclic frame: FPWR(DC32) + FRMW(DC32) + LRW(%u bytes)\n",
              process_length);
+#else
+      printf("PDO-only LRW test cyclic frame: LRW(%u bytes) + FRMW(DC64)\n",
+             process_length);
+#endif
       printf("Mailbox status bytes excluded from LRW: %d\n",
              group->mbxstatuslength);
    }
@@ -1882,7 +2065,11 @@ void ecatbringup(char *ifname)
       fprintf(stderr, "WARNING: DC 0x092C did not converge before SYNC0 activation, continue for Step-3 observation\n");
    }
 #else
+#if ENABLE_PDO_ONLY_LRW_TEST
+   printf("PDO-only LRW test path: skip IGH-style 0x092C start convergence\n");
+#else
    printf("Standard SOEM DC path: skip IGH-style 0x092C start convergence\n");
+#endif
 #endif
 
    /* Enable Sync0 for every DC capable slave */
@@ -1919,6 +2106,8 @@ void ecatbringup(char *ifname)
       {
 #if ENABLE_IGH_REFERENCE_SYNC
          printf("Slave %d cyclic mailbox handler disabled in IGH reference mode\n", si);
+#elif ENABLE_PDO_ONLY_LRW_TEST
+         printf("Slave %d cyclic mailbox handler disabled in PDO-only LRW test mode\n", si);
 #else
          ecx_slavembxcyclic(&ctx, si);
          printf("Slave %d added to cyclic mailbox handler\n", si);
@@ -2291,6 +2480,8 @@ int main(int argc, char *argv[])
    printf("SOEM EtherCAT Master (IGH-aligned CSP baseline)\n");
 #if ENABLE_IGH_REFERENCE_SYNC
    printf("Cyclic mode: IGH-style FPWR(DC32) + FRMW(DC32) + LRW(PDO)\n\n");
+#elif ENABLE_PDO_ONLY_LRW_TEST
+   printf("Cyclic mode: Step4 standard DC + PDO-only LRW(28) + FRMW(DC64)\n\n");
 #else
    printf("Cyclic mode: standard SOEM LRW(PDO) + FRMW(DC64)\n\n");
 #endif
@@ -2367,6 +2558,8 @@ int main(int argc, char *argv[])
       printf("NOTE: current master cycle is %" PRId64 " us\n",
              cycletime / 1000);
    }
+#elif ENABLE_PDO_ONLY_LRW_TEST
+   printf("PDO-only LRW test is ENABLED: keep SOEM ec_sync(), LRW length = Obytes + Ibytes\n");
 #endif
 
    if (argc > 1)
