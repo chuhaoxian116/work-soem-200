@@ -28,38 +28,46 @@
  *   PRE-OP PDO remap -> PDO map -> ESC DC config -> SAFE-OP warmup
  *   -> OP -> CiA402/CSP command sequence.
  *
- * It does NOT implement any SOEM source-level DCM frame reorder test.
- * Current SOEM cyclic process-data frame is still the default:
- *   LRW(process data) + FRMW(DC system time).
+ * The optional IGH reference-clock test keeps all changes in this demo and
+ * sends one cyclic frame in the order observed in the IGH capture:
+ *   FPWR(DC system time low 32 bits) + FRMW(DC time low 32 bits) + LRW(PDO).
  *
  * Cleanup policy:
- *   - Keep runtime control logic unchanged.
+ *   - Do not gate CSP motion on status-word bit12; match the working IgH demo.
  *   - Remove dead/unsafe helper code that is not called.
  *   - Keep one-shot startup diagnostics behind macros.
  *   - Disable OP-loop SDO debug by default to avoid mailbox noise during CSP.
  */
-#define ENABLE_STARTUP_ESC_DEBUG      1
-#define ENABLE_STARTUP_COE_DC_DIAG   1
+#define ENABLE_STARTUP_ESC_DEBUG      0
+#define ENABLE_STARTUP_COE_DC_DIAG   0
 #define ENABLE_OP_SDO_DEBUG          0
 #define ENABLE_CYCLE_DC_TIME_PRINT   0
+#define ENABLE_IGH_REFERENCE_SYNC    0
+#define ENABLE_ENI_DC_PREINIT        0
+#define ENABLE_SAFEOP_DC_PRECHECK     0
 
 /*
  * DC verification policy
  * ----------------------
- * Official SOEM DC guidance recommends allowing enough clock-distribution
- * cycles before OP. At 8ms, 10000 cycles are about 80 seconds.
+ * Allow enough clock-distribution cycles before OP. The elapsed verification
+ * time is DC_VERIFY_STABLE_CYCLES multiplied by the selected master cycle.
  *
- * This only validates the current baseline behavior:
- *   SOEM default cyclic frame = LRW(process data) + FRMW(DC system time)
+ * With ENABLE_IGH_REFERENCE_SYNC, the cyclic PDO frame excludes SOEM mailbox-status
+ * bytes and sends LRW length = Obytes + Ibytes. For your mapping this should be
+ * 13 + 15 = 28 bytes, matching the IGH capture.
  *
- * It does not change PDO mapping, CiA402/CSP control, DC register setup,
- * or SOEM process-data frame order.
+ * It does not change PDO mapping, CiA402/CSP control, or DC register setup.
  */
 #define DC_VERIFY_LIMIT_NS           100000LL   /* 100 us */
-#define DC_VERIFY_STABLE_CYCLES      10000      /* 10000 * 8ms = 80s */
-#define DC_VERIFY_TIMEOUT_MS         120000     /* 120s */
-#define DC_VERIFY_PRINT_EVERY        500        /* 500 * 8ms = 4s */
+#define DC_VERIFY_STABLE_CYCLES      200
+#define DC_VERIFY_TIMEOUT_MS         12000     /* 12s */
+#define DC_VERIFY_PRINT_EVERY        500
 #define DC_VERIFY_REQUIRE_PASS       0          /* 1: stop before OP if verification fails */
+
+/* Match the IGH startup sequence: converge 0x092C before enabling SYNC0. */
+#define DC_START_DIFF_LIMIT_NS       10000LL
+#define DC_START_TIMEOUT_MS          12000
+#define DC_START_PRINT_EVERY         500
 
 #define EC_TIMEOUTMON 500
 #define NSEC_PER_SEC  1000000000
@@ -73,9 +81,8 @@ static int wkc;
 static int mappingdone, dorun, inOP, run, dowkccheck;
 static int currentgroup = 0;
 static int warmup_cycles = 20;
-// 对齐商用 DCDemo / ENI：默认 8ms 周期（8000000ns）
-// 可通过命令行第二参数修改，单位 us，例如 8000 = 8ms
-static int64_t cycletime = 8000000;
+/* 对齐已验证可正常运动的 IGH myproject：默认 1 ms 周期。 */
+static int64_t cycletime = 1000000;
 
 static ecx_contextt ctx;
 
@@ -149,26 +156,47 @@ void add_time_ns(ec_timet *ts, int64 addtime)
 
 static float pgain = 0.01f;
 static float igain = 0.00002f;
-/* 对齐 Acontis DCM MasterShift:
- * nCtlSetVal = cycle * 2 / 3
- * 8ms => 5333333ns
+/*
+ * IGH 抓包中 application time 与 SYNC0 start time 同相。
+ * ecx_dcsync0() 的 shift 也为 0，因此不再引入 2/3 周期相移。
  */
-static int64 syncoffset = 5333333;
+static int64 syncoffset = 0;
 static int64 timeerror;
 
-/* PI calculation to get linux time synced to DC time */
-void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime)
+#if ENABLE_IGH_REFERENCE_SYNC
+typedef struct
 {
-   static int64 integral = 0;
-   int64 delta;
-   delta = (reftime - syncoffset) % cycletime;
+   int pending_idx;
+   uint16_t fpwr_wkc_offset;
+   uint16_t frmw_data_offset;
+   uint16_t frmw_wkc_offset;
+   uint16_t lrw_data_offset;
+   uint16_t process_length;
+   int64_t application_time_ns;
+   int64_t sent_application_time_ns;
+   bool application_time_valid;
+} IghCycleState_t;
+
+static IghCycleState_t igh_cycle = {
+   .pending_idx = -1
+};
+#endif
+
+static void update_dc_error(int64 reftime)
+{
+   int64 delta = (reftime - syncoffset) % cycletime;
+
    if (delta > (cycletime / 2))
    {
-      delta = delta - cycletime;
+      delta -= cycletime;
    }
+   else if (delta < -(cycletime / 2))
+   {
+      delta += cycletime;
+   }
+
    timeerror = -delta;
 
-   // 记录历史最大DC误差（取绝对值）跳过前面200周期
    if (total_cycles > warmup_cycles)
    {
       int64_t abs_dc_error = llabs(timeerror);
@@ -178,9 +206,314 @@ void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime)
 
       total_dc_error_ns += abs_dc_error;
    }
+}
+
+/* PI calculation to get linux time synced to DC time */
+void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime)
+{
+   static int64 integral = 0;
+
+   (void)cycletime;
+   update_dc_error(reftime);
 
    integral += timeerror;
    *offsettime = (int64)((timeerror * pgain) + (integral * igain));
+}
+
+#if ENABLE_IGH_REFERENCE_SYNC
+static int64_t ethercat_time_now_ns(void)
+{
+   ec_timet now = osal_current_time();
+
+   return ((int64_t)now.tv_sec - 946684800LL) * NSEC_PER_SEC + now.tv_nsec;
+}
+
+static void igh_init_application_time(void)
+{
+   int64_t now = ethercat_time_now_ns();
+   int64_t phase = now % cycletime;
+   int64_t aligned = now - phase + syncoffset;
+
+   if ((aligned - now) > (cycletime / 2))
+      aligned -= cycletime;
+   else if ((now - aligned) > (cycletime / 2))
+      aligned += cycletime;
+
+   igh_cycle.application_time_ns = aligned;
+   igh_cycle.application_time_valid = true;
+
+   printf("IGH reference application time initialized: %" PRId64
+          " ns, phase=%" PRId64 " ns\n",
+          aligned,
+          aligned % cycletime);
+}
+
+static int send_igh_processdata(void)
+{
+   ec_groupt *group = &ctx.grouplist[currentgroup];
+   uint32_t app_time_le;
+   uint32_t dc_time_le = 0;
+   uint32_t log_addr;
+   uint16_t w1;
+   uint16_t w2;
+   uint16_t process_length;
+   uint16_t dc_slave;
+   uint8_t idx;
+
+   if (igh_cycle.pending_idx >= 0)
+   {
+      return 0;
+   }
+
+   if (group->blockLRW || !group->hasdc || !group->DCnext)
+   {
+      return 0;
+   }
+
+   /*
+    * Keep the cyclic LRW payload equal to pure PDO data.
+    * Your PDO mapping is:
+    *   RxPDO = 13 bytes
+    *   TxPDO = 15 bytes
+    * Therefore the IGH-aligned LRW length must be 28 bytes.
+    *
+    * Do NOT use group->IOsegment[0] as LRW length here, because SOEM may
+    * include one extra mailbox/status byte in the segment and produce 29 bytes.
+    */
+   process_length = (uint16_t)(group->Obytes + group->Ibytes);
+   if (!process_length || !group->outputs ||
+       !group->nsegments || process_length > group->IOsegment[0])
+   {
+      return 0;
+   }
+
+   if (!igh_cycle.application_time_valid)
+   {
+      igh_init_application_time();
+   }
+
+   if (group->mbxstatus && group->mbxstatuslength)
+   {
+      memset(group->mbxstatus, 0, group->mbxstatuslength);
+   }
+
+   igh_cycle.sent_application_time_ns = igh_cycle.application_time_ns;
+   app_time_le = htoel((uint32_t)igh_cycle.sent_application_time_ns);
+   igh_cycle.application_time_ns += cycletime;
+
+   dc_slave = ctx.slavelist[group->DCnext].configadr;
+   log_addr = group->logstartaddr;
+   w1 = LO_WORD(log_addr);
+   w2 = HI_WORD(log_addr);
+   idx = ecx_getindex(&ctx.port);
+
+   /*
+    * IGH capture order:
+    *   1) FPWR : write low 32-bit application time to ESC DC system time
+    *   2) FRMW : read-modify-write low 32-bit ESC DC system time
+    *   3) LRW  : process data, length = 13 + 15 = 28 bytes
+    */
+   ecx_setupdatagram(&ctx.port, &ctx.port.txbuf[idx],
+                     EC_CMD_FPWR, idx, dc_slave, ECT_REG_DCSYSTIME,
+                     sizeof(app_time_le), &app_time_le);
+   igh_cycle.fpwr_wkc_offset = EC_HEADERSIZE + sizeof(app_time_le);
+
+   igh_cycle.frmw_data_offset =
+      ecx_adddatagram(&ctx.port, &ctx.port.txbuf[idx],
+                      EC_CMD_FRMW, idx, TRUE,
+                      dc_slave, ECT_REG_DCSYSTIME,
+                      sizeof(dc_time_le), &dc_time_le);
+   igh_cycle.frmw_wkc_offset =
+      igh_cycle.frmw_data_offset + sizeof(dc_time_le);
+
+   igh_cycle.lrw_data_offset =
+      ecx_adddatagram(&ctx.port, &ctx.port.txbuf[idx],
+                      EC_CMD_LRW, idx, FALSE,
+                      w1, w2, process_length, group->outputs);
+   igh_cycle.process_length = process_length;
+
+   if (ecx_outframe_red(&ctx.port, idx) <= 0)
+   {
+      ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+      return 0;
+   }
+
+   igh_cycle.pending_idx = idx;
+   return 1;
+}
+
+static int receive_igh_processdata(int timeout)
+{
+   ec_groupt *group = &ctx.grouplist[currentgroup];
+   uint8_t *rxbuf;
+   uint16_t le_wkc;
+   uint16_t fpwr_wkc;
+   uint16_t frmw_wkc;
+   uint16_t lrw_wkc;
+   uint32_t le_dc_low;
+   uint32_t dc_low;
+   uint64_t anchor;
+   uint64_t candidate;
+   uint8_t idx;
+   int frame_wkc;
+
+   if (igh_cycle.pending_idx < 0)
+   {
+      return EC_NOFRAME;
+   }
+
+   idx = (uint8_t)igh_cycle.pending_idx;
+   frame_wkc = ecx_waitinframe(&ctx.port, idx, timeout);
+   if (frame_wkc <= EC_NOFRAME)
+   {
+      ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+      igh_cycle.pending_idx = -1;
+      return EC_NOFRAME;
+   }
+
+   rxbuf = ctx.port.rxbuf[idx];
+   if (rxbuf[EC_CMDOFFSET] != EC_CMD_FPWR)
+   {
+      ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+      igh_cycle.pending_idx = -1;
+      return EC_NOFRAME;
+   }
+
+   memcpy(group->outputs,
+          &rxbuf[igh_cycle.lrw_data_offset],
+          igh_cycle.process_length);
+
+   memcpy(&le_wkc,
+          &rxbuf[igh_cycle.fpwr_wkc_offset],
+          sizeof(le_wkc));
+   fpwr_wkc = etohs(le_wkc);
+
+   memcpy(&le_wkc,
+          &rxbuf[igh_cycle.frmw_wkc_offset],
+          sizeof(le_wkc));
+   frmw_wkc = etohs(le_wkc);
+
+   memcpy(&le_wkc,
+          &rxbuf[igh_cycle.lrw_data_offset + igh_cycle.process_length],
+          sizeof(le_wkc));
+   lrw_wkc = etohs(le_wkc);
+
+   memcpy(&le_dc_low,
+          &rxbuf[igh_cycle.frmw_data_offset],
+          sizeof(le_dc_low));
+   dc_low = etohl(le_dc_low);
+
+   anchor = (uint64_t)igh_cycle.sent_application_time_ns;
+   candidate = (anchor & 0xffffffff00000000ULL) | dc_low;
+   if ((candidate + 0x80000000ULL) < anchor)
+      candidate += 0x100000000ULL;
+   else if (candidate > (anchor + 0x80000000ULL))
+      candidate -= 0x100000000ULL;
+   ctx.DCtime = (int64_t)candidate;
+
+   if (((fpwr_wkc != 1) || (frmw_wkc != 1)) &&
+       ((total_cycles % 1000) == 0))
+   {
+      printf("IGH DC datagram WKC mismatch: FPWR=%u FRMW=%u\n",
+             fpwr_wkc, frmw_wkc);
+   }
+
+   ecx_setbufstat(&ctx.port, idx, EC_BUF_EMPTY);
+   igh_cycle.pending_idx = -1;
+   return lrw_wkc;
+}
+
+static int send_cyclic_processdata(void)
+{
+   return send_igh_processdata();
+}
+
+static int receive_cyclic_processdata(int timeout)
+{
+   return receive_igh_processdata(timeout);
+}
+#else
+static int send_cyclic_processdata(void)
+{
+   return ecx_send_processdata(&ctx);
+}
+
+static int receive_cyclic_processdata(int timeout)
+{
+   return ecx_receive_processdata(&ctx, timeout);
+}
+#endif
+
+/*
+ * IGH keeps reference-clock frames running while it polls ESC register 0x092C,
+ * and only enables SYNC0 after the system-time difference has converged. The
+ * previous SOEM flow enabled SYNC0 immediately after ecx_configdc(), so the
+ * later SAFE_OP phase check happened too late to reproduce the IGH startup.
+ */
+static bool wait_dc_start_convergence(uint16_t slave)
+{
+   ec_timet wakeup_time;
+   uint16_t configadr = ctx.slavelist[slave].configadr;
+   int timeout_cycles = (int)((DC_START_TIMEOUT_MS * 1000000LL) / cycletime);
+   int32_t diff_le = 0;
+   int32_t diff_ns = 0;
+   int valid_samples = 0;
+
+   printf("\n========== DC Start Convergence ==========\n");
+   printf("Difference limit : %" PRId64 " ns\n", (int64_t)DC_START_DIFF_LIMIT_NS);
+   printf("Timeout          : %d ms (%d cycles)\n",
+          DC_START_TIMEOUT_MS, timeout_cycles);
+
+   osal_get_monotonic_time(&wakeup_time);
+
+   for (int i = 0; i < timeout_cycles && run; i++)
+   {
+      int dc_wkc;
+      int64_t abs_diff;
+
+      add_time_ns(&wakeup_time, cycletime);
+      osal_monotonic_sleep(&wakeup_time);
+
+      if (send_cyclic_processdata() > 0)
+      {
+         (void)receive_cyclic_processdata(EC_TIMEOUTRET);
+      }
+
+      diff_le = 0;
+      dc_wkc = ecx_FPRD(&ctx.port, configadr, ECT_REG_DCSYSDIFF,
+                        sizeof(diff_le), &diff_le, EC_TIMEOUTRET);
+      if (dc_wkc <= 0)
+      {
+         if ((i % DC_START_PRINT_EVERY) == 0)
+         {
+            printf("DC start convergence: 0x092C read failed, wkc=%d\n", dc_wkc);
+         }
+         continue;
+      }
+
+      diff_ns = (int32_t)etohl((uint32_t)diff_le);
+      abs_diff = llabs((int64_t)diff_ns);
+      valid_samples++;
+
+      if ((i % DC_START_PRINT_EVERY) == 0)
+      {
+         printf("DC start convergence: cycle=%d diff=%d ns abs=%" PRId64 " ns\n",
+                i, diff_ns, abs_diff);
+      }
+
+      if (abs_diff <= DC_START_DIFF_LIMIT_NS)
+      {
+         printf("DC start convergence: PASS after %d cycles, diff=%d ns\n",
+                i + 1, diff_ns);
+         printf("==========================================\n\n");
+         return true;
+      }
+   }
+
+   printf("DC start convergence: FAIL, valid_samples=%d last_diff=%d ns\n",
+          valid_samples, diff_ns);
+   printf("==========================================\n\n");
+   return false;
 }
 
 // ==============================================
@@ -700,15 +1033,14 @@ void runWork()
    static int dir = 1;
    static int hold_cycles = 0;
    static int wait_follow_cnt = 0;
+   static int enable_state_cycles = 0;
 
-   /*
-    * 对齐 DCDemo：8ms EtherCAT 周期。
-    * 原来 1ms 下 20 count/cycle = 20000 count/s。
-    * 8ms 下为了保持相近速度，改成 160 count/cycle。
-    */
-   const int32_t CSP_STEP_PER_CYCLE = 160;
+   /* 保持约 20000 count/s，并让 1 ms/8 ms 参数下的速度一致。 */
+   const int32_t CSP_STEP_PER_CYCLE =
+      (int32_t)((20000LL * cycletime) / NSEC_PER_SEC);
    const int32_t CSP_MOVE_RANGE     = 100000;
-   const int     CSP_HOLD_CYCLES    = 125;  // 125 * 8ms = 1s
+   const int     CSP_HOLD_CYCLES    = (int)(NSEC_PER_SEC / cycletime);
+   const int     ENABLE_HOLD_CYCLES = (int)(NSEC_PER_SEC / cycletime);
 
    uint16_t sw = tx_pdo ? tx_pdo->status_word : 0;
 
@@ -739,6 +1071,7 @@ void runWork()
                    tx_pdo->operation_mode_display);
          }
 
+         enable_state_cycles = 0;
          step = 100;
       }
       break;
@@ -751,7 +1084,9 @@ void runWork()
          motion_cmd.target_velocity = 0;
          motion_cmd.target_torque = 0;
 
-         if ((sw & 0x006F) == 0x0021) {
+         enable_state_cycles++;
+         if (((sw & 0x006F) == 0x0021) &&
+             (enable_state_cycles >= ENABLE_HOLD_CYCLES)) {
             if (!step_printed[1]) {
                step_printed[1] = true;
                printf("[Step 100] Ready to switch on, CW:0x%04X, SW:0x%04X, fixed target:%d, pos:%d, mode:%d\n",
@@ -761,6 +1096,7 @@ void runWork()
                       tx_pdo->actual_position,
                       tx_pdo->operation_mode_display);
             }
+            enable_state_cycles = 0;
             step = 200;
          }
       }
@@ -774,7 +1110,9 @@ void runWork()
          motion_cmd.target_velocity = 0;
          motion_cmd.target_torque = 0;
 
-         if ((sw & 0x006F) == 0x0023) {
+         enable_state_cycles++;
+         if (((sw & 0x006F) == 0x0023) &&
+             (enable_state_cycles >= ENABLE_HOLD_CYCLES)) {
             if (!step_printed[2]) {
                step_printed[2] = true;
                printf("[Step 200] Switched on, CW:0x%04X, SW:0x%04X, fixed target:%d, pos:%d, mode:%d\n",
@@ -784,6 +1122,7 @@ void runWork()
                       tx_pdo->actual_position,
                       tx_pdo->operation_mode_display);
             }
+            enable_state_cycles = 0;
             step = 300;
          }
       }
@@ -798,23 +1137,44 @@ void runWork()
          motion_cmd.target_torque = 0;
 
          bool operation_enabled = ((sw & 0x006F) == 0x0027);
-         // bool csp_follow_active = ((sw == 0x1637) || (sw == 0x1237) || ((sw & 0x1000) != 0));
 
-         if (operation_enabled) {
-            if (!step_printed[3]) {
-               step_printed[3] = true;
-               printf("[Step 300] Operation enabled, CW:0x%04X, SW:0x%04X, bit12=%d, fixed target:%d, pos:%d, mode:%d\n",
-                      motion_cmd.control_word,
-                      sw,
-                      (sw & 0x1000) ? 1 : 0,
-                      csp_target,
-                      tx_pdo->actual_position,
-                      tx_pdo->operation_mode_display);
+         /*
+          * 对齐已经能正常运动的 IgH demo：
+          *   0x000F 保持固定周期后进入运动；
+          *   6041 bit12 只作为观察信息打印，不作为进入运动的硬条件。
+          *
+          * 你的日志中 SW=0x0637 已经表示 Operation enabled，
+          * 但 bit12 一直为 0，原逻辑会永久卡在 Step 300。
+          */
+         if (operation_enabled)
+         {
+            enable_state_cycles++;
+
+            if (enable_state_cycles >= ENABLE_HOLD_CYCLES)
+            {
+               if (!step_printed[3])
+               {
+                  step_printed[3] = true;
+                  printf("[Step 300] Operation enabled, CW:0x%04X, SW:0x%04X, bit12=%d, fixed target:%d, pos:%d, mode:%d\n",
+                         motion_cmd.control_word,
+                         sw,
+                         (sw & 0x1000) ? 1 : 0,
+                         csp_target,
+                         tx_pdo->actual_position,
+                         tx_pdo->operation_mode_display);
+               }
+
+               enable_state_cycles = 0;
+               step = 400;
             }
-            step = 400;
-         } else {
-            if ((wait_follow_cnt++ % 1000) == 0) {
-               printf("[Step 300] waiting CSP follow active, CW:0x%04X, SW:0x%04X, op_en=%d, bit12=%d, target:%d, pos:%d\n",
+         }
+         else
+         {
+            enable_state_cycles = 0;
+
+            if ((wait_follow_cnt++ % 1000) == 0)
+            {
+               printf("[Step 300] waiting operation enabled, CW:0x%04X, SW:0x%04X, op_en=%d, bit12=%d, target:%d, pos:%d\n",
                       motion_cmd.control_word,
                       sw,
                       operation_enabled ? 1 : 0,
@@ -949,15 +1309,16 @@ void debug_read_drive_dc_diag(uint16_t slave, const char *tag)
 }
 
 /*
- * Wait until the master cycle phase is stable relative to the EtherCAT DC time.
+ * Check the reference-time phase echoed by the FPWR/FRMW pair in SAFE_OP.
  *
  * What this verifies:
  *   - RT process-data cycle is running.
  *   - WKC is equal to expectedWKC.
- *   - ec_sync() has pulled the Linux wake-up time close to the requested
- *     DC phase target: syncoffset = cycle * 2 / 3.
+ *   - The reference time written by this application has the requested phase.
  *
  * What this does NOT prove by itself:
+ *   - This is not an independent measurement of SYNC0/PDO alignment because
+ *     FRMW reads the reference clock immediately after FPWR updates it.
  *   - The drive application layer has accepted CSP/DC synchronization.
  *     That still needs to be confirmed by 6041 bit12 = 1 and ActualPosition
  *     following TargetPosition.
@@ -974,7 +1335,7 @@ bool wait_dc_sync_stable(int64_t limit_ns, int stable_cycles, int timeout_ms)
    int64_t sum_abs_err = 0;
    int timeout_cycles = (int)((timeout_ms * 1000000LL) / cycletime);
 
-   printf("\n========== DC SAFE_OP Verification ==========\n");
+   printf("\n========== DC Reference Phase Precheck ==========\n");
    printf("Cycle time        : %" PRId64 " ns\n", cycletime);
    printf("Sync offset       : %" PRId64 " ns\n", syncoffset);
    printf("Error limit       : %" PRId64 " ns\n", limit_ns);
@@ -1060,7 +1421,7 @@ bool wait_dc_sync_stable(int64_t limit_ns, int stable_cycles, int timeout_ms)
       {
          int64_t avg_abs_err = valid_samples ? (sum_abs_err / valid_samples) : 0;
 
-         printf("\n========== DC SAFE_OP Verification Result ==========\n");
+         printf("\n========== DC Reference Phase Precheck Result ==========\n");
          printf("Result            : PASS\n");
          printf("Final error       : %" PRId64 " ns\n", timeerror);
          printf("Avg abs error     : %" PRId64 " ns\n", avg_abs_err);
@@ -1077,7 +1438,7 @@ bool wait_dc_sync_stable(int64_t limit_ns, int stable_cycles, int timeout_ms)
 
    int64_t avg_abs_err = valid_samples ? (sum_abs_err / valid_samples) : 0;
 
-   printf("\n========== DC SAFE_OP Verification Result ==========\n");
+   printf("\n========== DC Reference Phase Precheck Result ==========\n");
    printf("Result            : FAIL\n");
    printf("Final error       : %" PRId64 " ns\n", timeerror);
    printf("Avg abs error     : %" PRId64 " ns\n", avg_abs_err);
@@ -1109,7 +1470,12 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
    osal_get_monotonic_time(&ts);
    ht = (ts.tv_nsec / 1000000) + 1; /* round to nearest ms */
    ts.tv_nsec = ht * 1000000;
-   ecx_send_processdata(&ctx);
+   if (ts.tv_nsec >= NSEC_PER_SEC)
+   {
+      ts.tv_sec++;
+      ts.tv_nsec -= NSEC_PER_SEC;
+   }
+   send_cyclic_processdata();
 
    // 初始化单调时钟时间戳
    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
@@ -1156,16 +1522,19 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
 #endif
          // ==============================================
          // EtherCAT 通讯：收上一周期返回帧
-         //
-         // SOEM 默认发送路径仍然是：LRW(process data) + FRMW(DC time)。
-         // 这里不做任何 DCM 帧重排实验。
+         // IGH 抓包路径为 FPWR(DC32) + FRMW(DC32) + LRW(PDO)。
          // ==============================================
-         wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+         wkc = receive_cyclic_processdata(EC_TIMEOUTRET);
          dowkccheck = (wkc == expectedWKC) ? 0 : dowkccheck + 1;
 
          if (ctx.slavelist[1].hasdc && (wkc > 0))
          {
+#if ENABLE_IGH_REFERENCE_SYNC
+            update_dc_error(ctx.DCtime);
+            toff = 0;
+#else
             ec_sync(ctx.DCtime, cycletime, &toff);
+#endif
          }
 
          // ==============================================
@@ -1183,8 +1552,10 @@ OSAL_THREAD_FUNC_RT ecatthread(void)
             rx_pdo->operation_mode = motion_cmd.operation_mode;
          }
 
+#if !ENABLE_IGH_REFERENCE_SYNC
          ecx_mbxhandler(&ctx, 0, 4);
-         ecx_send_processdata(&ctx);
+#endif
+         send_cyclic_processdata();
       }
    }
 }
@@ -1441,17 +1812,15 @@ void ecatbringup(char *ifname)
 
    /* 3. Configure Distributed Clocks */
 
-   /*
-    * ENI-style DC/ESC reset/filter/latch initialization.
-    *
-    * This intentionally runs before ecx_configdc() and ecx_dcsync0().
-    * It only adds the ENI clear/reset/filter/latch commands that are not
-    * covered by the current manual PDO mapping path.
-    */
+   /* Optional ENI reset/filter/latch experiment; disabled in the IGH baseline. */
+#if ENABLE_ENI_DC_PREINIT
    execute_eni_dc_preinit(slave);
+#else
+   printf("ENI DC preinit disabled for IGH-aligned baseline\n");
+#endif
 
 #if ENABLE_STARTUP_ESC_DEBUG
-   debug_read_esc_dc_regs(slave, "after ENI DC preinit, before ecx_configdc");
+   debug_read_esc_dc_regs(slave, "after optional ENI DC preinit, before ecx_configdc");
 #endif
 
    printf("\nConfiguring Distributed Clocks...\n");
@@ -1460,18 +1829,49 @@ void ecatbringup(char *ifname)
    debug_read_esc_dc_regs(slave, "after ecx_configdc, before dcsync0");
 #endif
 
+#if ENABLE_IGH_REFERENCE_SYNC
+   {
+      uint32_t process_length = group->Obytes + group->Ibytes;
+
+      if (group->blockLRW || !group->hasdc || !group->DCnext ||
+          !group->outputs || !group->nsegments ||
+          !process_length || process_length > group->IOsegment[0])
+      {
+         printf("ERROR: IO mapping is not compatible with the single-frame IGH reference path\n");
+         ecx_close(&ctx);
+         return;
+      }
+
+      printf("IGH reference cyclic frame: FPWR(DC32) + FRMW(DC32) + LRW(%u bytes)\n",
+             process_length);
+      printf("Mailbox status bytes excluded from LRW: %d\n",
+             group->mbxstatuslength);
+   }
+#endif
+
+   /*
+    * The 0x092C convergence loop is only meaningful for the experimental
+    * IGH-style custom cyclic frame. In the standard SOEM path, keep startup
+    * simple: configdc() -> dcsync0() -> SAFE_OP warmup -> OP.
+    */
+#if ENABLE_IGH_REFERENCE_SYNC
+   if (!wait_dc_start_convergence(slave))
+   {
+      fprintf(stderr, "ERROR: DC did not converge before SYNC0 activation\n");
+      ecx_close(&ctx);
+      return;
+   }
+#else
+   printf("Standard SOEM DC path: skip IGH-style 0x092C start convergence\n");
+#endif
+
    /* Enable Sync0 for every DC capable slave */
    for (int i = 1; i <= ctx.slavecount; i++)
    {
       if (ctx.slavelist[i].hasdc)
       {
          printf("Enable DC Sync0 Slave %d, cycle = %" PRId64 " ns\n", i, cycletime);
-         //ecx_dcsync0(&ctx, i, TRUE, cycletime, 0);
-
-         if (!execute_eni_manual_sync0(i))
-         {
-            printf("ERROR: ENI manual Sync0 configuration failed on slave %d\n", i);
-         }
+         ecx_dcsync0(&ctx, i, TRUE, cycletime, 0);
       }
       else
       {
@@ -1487,10 +1887,7 @@ void ecatbringup(char *ifname)
    debug_read_drive_dc_diag(slave, "before SAFE_OP");
 #endif
 
-   /*
-    * 4. Add CoE slaves to cyclic mailbox handler.
-    * This is optional for pure PDO, but keep your original behavior.
-    */
+   /* 4. The IGH comparison keeps mailbox traffic out of the PDO cycle. */
    for (int si = 1; si <= ctx.slavecount; si++)
    {
       ec_slavet *slv = &ctx.slavelist[si];
@@ -1500,8 +1897,12 @@ void ecatbringup(char *ifname)
 
       if (slv->CoEdetails > 0)
       {
+#if ENABLE_IGH_REFERENCE_SYNC
+         printf("Slave %d cyclic mailbox handler disabled in IGH reference mode\n", si);
+#else
          ecx_slavembxcyclic(&ctx, si);
          printf("Slave %d added to cyclic mailbox handler\n", si);
+#endif
       }
    }
 
@@ -1545,8 +1946,8 @@ void ecatbringup(char *ifname)
 
    for (int i = 0; i < 300; i++)
    {
-      ecx_send_processdata(&ctx);
-      wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+      send_cyclic_processdata();
+      wkc = receive_cyclic_processdata(EC_TIMEOUTRET);
       osal_usleep(cycletime / 1000);
    }
 
@@ -1570,8 +1971,8 @@ void ecatbringup(char *ifname)
 
    for (int i = 0; i < 100; i++)
    {
-      ecx_send_processdata(&ctx);
-      wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+      send_cyclic_processdata();
+      wkc = receive_cyclic_processdata(EC_TIMEOUTRET);
       osal_usleep(cycletime / 1000);
    }
 
@@ -1585,18 +1986,22 @@ void ecatbringup(char *ifname)
    dorun = 1;
 
    /*
-    * 7.1 DC verification in SAFE_OP.
+    * 7.1 Reference-time phase precheck in SAFE_OP.
     *
-    * Keep SOEM default cyclic frame unchanged here:
-    *   LRW(process data) + FRMW(DC system time)
+    * With ENABLE_IGH_REFERENCE_SYNC the cyclic frame is:
+    *   FPWR(DC32) + FRMW(DC32) + LRW(process data)
     *
-    * At 8ms, DC_VERIFY_STABLE_CYCLES=10000 means about 80 seconds.
-    * This verifies whether the current SOEM baseline can keep the master
-    * PDO cycle within the requested DC phase window for a long enough time.
+    * This only checks WKC and the reference-time phase echoed by FPWR/FRMW.
+    * The decisive drive-side check remains status-word bit12 after 0x000F.
     */
+#if ENABLE_SAFEOP_DC_PRECHECK
    bool dc_verify_ok = wait_dc_sync_stable(DC_VERIFY_LIMIT_NS,
                                            DC_VERIFY_STABLE_CYCLES,
                                            DC_VERIFY_TIMEOUT_MS);
+#else
+   bool dc_verify_ok = true;
+   printf("SAFE_OP DC phase precheck skipped for Step-1 control validation\n");
+#endif
 
 #if ENABLE_STARTUP_ESC_DEBUG
    debug_read_esc_dc_regs(slave, "after long SAFE_OP DC verification");
@@ -1821,8 +2226,12 @@ void ecatbringup(char *ifname)
 
 int main(int argc, char *argv[])
 {
-   printf("SOEM EtherCAT Master (Aging Mode, align DCDemo 8ms)\n");
-   printf("Default cycle time: 8ms, align eni_vm1_0616.xml / DCDemo\n\n");
+   printf("SOEM EtherCAT Master (IGH-aligned CSP baseline)\n");
+#if ENABLE_IGH_REFERENCE_SYNC
+   printf("Cyclic mode: IGH-style FPWR(DC32) + FRMW(DC32) + LRW(PDO)\n\n");
+#else
+   printf("Cyclic mode: standard SOEM LRW(PDO) + FRMW(DC64)\n\n");
+#endif
 
    // 全局内存锁定
    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
@@ -1850,12 +2259,12 @@ int main(int argc, char *argv[])
    if (argc > 2)
    {
       cycletime = (int64_t)atoi(argv[2]) * 1000;
-
-      /*
-       * 默认对齐 Acontis DCDemo / DCM MasterShift：
-       *   nCtlSetVal = ((dwBusCycleTimeUsec * 2) / 3) * 1000
-       */
-      syncoffset = (cycletime * 2) / 3;
+      if (cycletime <= 0)
+      {
+         fprintf(stderr, "ERROR: cycletime must be greater than zero\n");
+         return 1;
+      }
+      syncoffset = 0;
    }
 
    if (argc > 3)
@@ -1877,7 +2286,7 @@ int main(int argc, char *argv[])
       }
       else
       {
-         printf("WARNING: invalid syncoffset argument '%s', keep default 2/3 cycle.\n", argv[3]);
+         printf("WARNING: invalid syncoffset argument '%s', keep zero phase.\n", argv[3]);
       }
 
       if (syncoffset < 0) syncoffset = 0;
@@ -1888,6 +2297,15 @@ int main(int argc, char *argv[])
           cycletime / 1000,
           syncoffset,
           ((double)syncoffset * 100.0) / (double)cycletime);
+
+#if ENABLE_IGH_REFERENCE_SYNC
+   printf("IGH-style reference-clock synchronization is ENABLED\n");
+   if (cycletime != 1000000)
+   {
+      printf("NOTE: current master cycle is %" PRId64 " us\n",
+             cycletime / 1000);
+   }
+#endif
 
    if (argc > 1)
    {
@@ -1933,9 +2351,9 @@ int main(int argc, char *argv[])
    {
       ec_adaptert *adapter = NULL;
       ec_adaptert *head = NULL;
-      printf("Usage: %s ifname [cycletime]\n", argv[0]);
+      printf("Usage: %s ifname [cycletime_us] [sync_phase_percent_or_ns]\n", argv[0]);
       printf("ifname = eth0 for example\n");
-      printf("cycletime in us\n");
+      printf("default cycletime = 1000 us, default sync phase = 0\n");
 
       printf("\nAvailable adapters:\n");
       head = adapter = ec_find_adapters();
