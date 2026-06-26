@@ -16,13 +16,24 @@
 namespace siasun {
 namespace {
 
+/* SAFE_OP 阶段预热周期数；进入 OP 前先交换一段有效 PDO。*/
 constexpr int kSafeOpWarmupCycles = 300;
+/* 每次 SDO 写入后的等待时间，给从站 mailbox 处理留出余量。*/
 constexpr int kPostSdoDelayUs = 10000;
+/* SOEM check 线程中重配置/恢复从站使用的超时时间，单位 us。*/
 constexpr int kEthercatMonitorTimeoutUs = 500;
+/* 严重超周期阈值；超过 150% 标称周期计入 severe_overruns。*/
 constexpr uint64_t kCycleOverrunLimitNs =
     static_cast<uint64_t>(kCycleTimeNs * 3 / 2);
 constexpr double kPi = 3.14159265358979323846;
+/* SIASUN ESI 中的 mailbox SM0/SM1 配置；IgH 能正常下参时使用的也是这组 mailbox。*/
+constexpr uint16_t kMailboxOutStart = 0x1000;
+constexpr uint16_t kMailboxInStart = 0x1080;
+constexpr uint16_t kMailboxSize = 0x0080;
+constexpr uint32_t kMailboxOutFlags = 0x00010026;
+constexpr uint32_t kMailboxInFlags = 0x00010022;
 
+/* 第 6 轴 CiA402 使能和运动状态机。*/
 enum class ServoControlState {
     WaitStatus,
     Enable06,
@@ -31,16 +42,25 @@ enum class ServoControlState {
     SineMotion,
 };
 
+/* 第 6 轴运动控制状态，跨 1 ms 周期保存。*/
 struct ServoMotionControl {
+    /* 当前 CiA402/运动状态。*/
     ServoControlState state = ServoControlState::WaitStatus;
+    /* 当前状态已经保持的通信周期数。*/
     uint64_t state_cycles = 0;
+    /* 进入正弦运动后的累计周期数。*/
     uint64_t motion_cycles = 0;
+    /* 进入正弦运动时锁存的实际位置，作为轨迹中心。*/
     int32_t base_position = 0;
 };
 
+/* 通信质量统计，和 IgH 版报告口径保持相近。*/
 struct QualityStats {
+    /* 所有从站进入 OP 后才开始统计，避免启动阶段污染运行数据。*/
     bool active = false;
+    /* 已统计的运行周期总数。*/
     uint64_t cycles = 0;
+    /* 周期时间样本数；第一个周期只用于初始化 last_cycle_time_ns。*/
     uint64_t interval_samples = 0;
     uint64_t cycle_time_sum_ns = 0;
     uint64_t jitter_abs_sum_ns = 0;
@@ -64,24 +84,40 @@ struct QualityStats {
     uint64_t recovery_events = 0;
 };
 
+/* g_motion_control：RT 线程拥有的第 6 轴控制状态。*/
 ServoMotionControl g_motion_control {};
+/* g_quality_stats：RT/check 线程共同更新的通信质量统计。*/
 QualityStats g_quality_stats {};
+/* g_sync_offset_ns：SOEM DC PI 同步算法使用的相位基准。*/
 int64_t g_sync_offset_ns = 0;
 
+/*
+ * 将 SOEM ec_timet 转换为纳秒。
+ *
+ * ts：待转换的单调时间。
+ */
 int64_t timespec_to_ns(const ec_timet &ts) {
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
+/* 读取 SOEM OSAL 单调时间并转换为纳秒，用于周期质量统计。*/
 int64_t monotonic_raw_ns() {
     ec_timet now {};
     osal_get_monotonic_time(&now);
     return timespec_to_ns(now);
 }
 
+/* 纳秒转换为微秒，供质量报告打印使用。*/
 double ns_to_us(int64_t ns) {
     return static_cast<double>(ns) / 1000.0;
 }
 
+/*
+ * 在 ec_timet 上累加纳秒，并修正 tv_nsec 溢出。
+ *
+ * ts：周期线程下一次唤醒的绝对时间。
+ * addtime：需要累加的纳秒数，包含 DC PI 修正量。
+ */
 void add_time_ns(ec_timet *ts, int64_t addtime) {
     ec_timet addts {};
     addts.tv_nsec = addtime % 1000000000LL;
@@ -89,21 +125,33 @@ void add_time_ns(ec_timet *ts, int64_t addtime) {
     osal_timespecadd(ts, &addts, ts);
 }
 
+/* 预触碰栈内存，降低进入实时循环后首次访问栈页导致的抖动。*/
 void prefault_stack() {
+    /* dummy：主动访问的一段栈空间。*/
     volatile unsigned char dummy[kMaxSafeStack];
     for (std::size_t i = 0; i < sizeof(dummy); ++i) {
         dummy[i] = 0;
     }
 }
 
+/*
+ * SOEM 示例中的 DC PI 同步算法。
+ *
+ * reftime：SOEM 从 DC 报文得到的参考时间 ctx.DCtime。
+ * cycletime_ns：通信周期，当前为 1 ms。
+ * offsettime：输出给周期线程的下一周期唤醒修正量。
+ * stats：同步误差统计对象。
+ */
 void ec_sync(int64 reftime,
              int64 cycletime_ns,
              int64 *offsettime,
              QualityStats &stats) {
+    /* integral：PI 控制器积分项，跨周期累计 DC 时间误差。*/
     static int64 integral = 0;
     constexpr double kProportionalGain = 0.01;
     constexpr double kIntegralGain = 0.00002;
 
+    /* delta：当前 DC 参考时间相对周期边界的相位误差。*/
     int64 delta = (reftime - g_sync_offset_ns) % cycletime_ns;
     if (delta > (cycletime_ns / 2)) {
         delta -= cycletime_ns;
@@ -123,6 +171,14 @@ void ec_sync(int64 reftime,
         (static_cast<double>(integral) * kIntegralGain));
 }
 
+/*
+ * SOEM SDO 写辅助函数。
+ *
+ * context：SOEM 主站上下文。
+ * slave：SOEM 1-based 从站编号。
+ * index/subindex：对象字典地址。
+ * data/size：待写入 payload。
+ */
 int sdo_write(ecx_contextt *context,
               uint16_t slave,
               uint16_t index,
@@ -150,18 +206,27 @@ int sdo_write(ecx_contextt *context,
     return 0;
 }
 
+/*
+ * 配置单个 PDO 映射对象 0x1600 或 0x1A00。
+ *
+ * SOEM 没有 IgH 的 ecrt_slave_config_pdos() 抽象，这里直接按 CoE 规则：
+ * 先清 sub0，再写每个映射项，最后恢复 sub0 数量。
+ */
 template <std::size_t N>
 int configure_pdo_mapping(ecx_contextt *context,
                           uint16_t slave,
                           uint16_t pdo,
                           const std::array<PdoEntry, N> &entries) {
+    /* zero：写入 sub0 清空映射表，符合 CoE PDO remap 标准流程。*/
     uint8_t zero = 0;
     if (sdo_write(context, slave, pdo, 0x00, &zero, sizeof(zero))) {
         return -1;
     }
 
     for (std::size_t i = 0; i < entries.size(); ++i) {
+        /* entry：当前要写入 0x1600/0x1A00 的 PDO entry 描述。*/
         const PdoEntry &entry = entries[i];
+        /* mapping：index/subindex/bitlen 打包后的 32-bit 映射字。*/
         const uint32_t mapping =
             (static_cast<uint32_t>(entry.index) << 16) |
             (static_cast<uint32_t>(entry.subindex) << 8) |
@@ -180,10 +245,16 @@ int configure_pdo_mapping(ecx_contextt *context,
     return sdo_write(context, slave, pdo, 0x00, &count, sizeof(count));
 }
 
+/*
+ * 将 PDO 对象挂到 SyncManager assignment。
+ *
+ * assignment：0x1C12 表示 RxPDO(SM2)，0x1C13 表示 TxPDO(SM3)。
+ */
 int assign_pdo(ecx_contextt *context,
                uint16_t slave,
                uint16_t assignment,
                uint16_t pdo_index) {
+    /* zero/one：分别用于关闭和重新打开 SyncManager assignment。*/
     uint8_t zero = 0;
     uint8_t one = 1;
     return sdo_write(context, slave, assignment, 0x00, &zero, sizeof(zero)) ||
@@ -192,6 +263,11 @@ int assign_pdo(ecx_contextt *context,
            sdo_write(context, slave, assignment, 0x00, &one, sizeof(one));
 }
 
+/*
+ * 配置一个伺服从站的 RxPDO/TxPDO 映射。
+ *
+ * slave：SOEM 1-based 伺服从站编号，1-6 对应用户侧 Servo 1-6。
+ */
 int configure_servo_pdos(ecx_contextt *context, uint16_t slave) {
     std::printf("[PDO] configuring servo %u mapping\n", slave);
     if (ecx_statecheck(context, slave, EC_STATE_PRE_OP, EC_TIMEOUTSTATE) !=
@@ -211,6 +287,11 @@ int configure_servo_pdos(ecx_contextt *context, uint16_t slave) {
     return 0;
 }
 
+/*
+ * 配置末端 IO 从站的 RxPDO/TxPDO 映射。
+ *
+ * slave：SOEM 1-based 从站编号，当前为 7。
+ */
 int configure_endio_pdos(ecx_contextt *context, uint16_t slave) {
     std::printf("[PDO] configuring EndIO %u mapping\n", slave);
     if (ecx_statecheck(context, slave, EC_STATE_PRE_OP, EC_TIMEOUTSTATE) !=
@@ -230,6 +311,12 @@ int configure_endio_pdos(ecx_contextt *context, uint16_t slave) {
     return 0;
 }
 
+/*
+ * 请求整条 EtherCAT 总线切换状态。
+ *
+ * state：目标 AL 状态，例如 SAFE_OP 或 OP。
+ * name：目标状态名称，仅用于日志。
+ */
 bool request_state(ecx_contextt *context, uint16_t state, const char *name) {
     context->slavelist[0].state = state;
     ecx_writestate(context, 0);
@@ -251,18 +338,21 @@ bool request_state(ecx_contextt *context, uint16_t state, const char *name) {
     return false;
 }
 
+/* 清零单个伺服 RxPDO 输出区。*/
 void zero_servo_output(ServoRxPdo *rx) {
     if (rx) {
         std::memset(rx, 0, sizeof(*rx));
     }
 }
 
+/* 清零末端 IO RxPDO 输出区。*/
 void zero_endio_output(EndIoRxPdo *rx) {
     if (rx) {
         std::memset(rx, 0, sizeof(*rx));
     }
 }
 
+/* 清零全部业务输出；启动、等待 OP 和退出时都使用该默认输出。*/
 void write_default_outputs(App &app) {
     for (ServoRxPdo *rx : app.servo_rx) {
         zero_servo_output(rx);
@@ -270,23 +360,15 @@ void write_default_outputs(App &app) {
     zero_endio_output(app.endio_rx);
 }
 
-bool all_slaves_operational(App &app) {
-    ecx_readstate(&app.context);
-    if (app.context.slavecount < static_cast<int>(kExpectedSlaveCount)) {
-        return false;
-    }
-
-    for (int slave = 1; slave <= static_cast<int>(kExpectedSlaveCount);
-         ++slave) {
-        if (app.context.slavelist[slave].state != EC_STATE_OPERATIONAL) {
-            return false;
-        }
-    }
-    return true;
-}
-
+/*
+ * 第 6 轴保持当前位置。
+ *
+ * control_word：本周期要写入 0x6040 的控制字。
+ */
 void hold_motion_servo_position(App &app, uint16_t control_word) {
+    /* rx：第 6 轴主站输出 PDO。*/
     ServoRxPdo *rx = app.servo_rx[kMotionServoIndex];
+    /* tx：第 6 轴伺服反馈 PDO。*/
     const ServoTxPdo *tx = app.servo_tx[kMotionServoIndex];
     if (!rx || !tx) {
         return;
@@ -303,21 +385,31 @@ void hold_motion_servo_position(App &app, uint16_t control_word) {
     rx->user_output = 0;
 }
 
+/* 切换第 6 轴控制状态，并清零该状态的保持计数。*/
 void set_servo_control_state(ServoMotionControl &control,
                              ServoControlState state) {
     control.state = state;
     control.state_cycles = 0;
 }
 
+/*
+ * 更新第 6 轴控制 PDO。
+ *
+ * 只在所有从站 OP 后使能第 6 轴；其它轴在 write_cycle_outputs() 中保持 0。
+ */
 void update_motion_servo_control(App &app, ServoMotionControl &control) {
+    /* rx/tx：第 6 轴 PDO 指针；只有两者均有效才允许写控制量。*/
     ServoRxPdo *rx = app.servo_rx[kMotionServoIndex];
     const ServoTxPdo *tx = app.servo_tx[kMotionServoIndex];
     if (!rx || !tx) {
         return;
     }
 
+    /* status_word：第 6 轴 CiA402 状态字。*/
     const uint16_t status_word = tx->status_word;
+    /* actual_position：第 6 轴当前实际位置，用于保持和轨迹基准。*/
     const int32_t actual_position = tx->actual_position;
+    /* op_ready：应用层和 SOEM AL 状态均确认 OP 后才开始使能。*/
     const bool op_ready =
         app.in_op &&
         app.context.slavelist[kMotionServoIndex + 1].state ==
@@ -367,14 +459,17 @@ void update_motion_servo_control(App &app, ServoMotionControl &control) {
         break;
 
     case ServoControlState::SineMotion: {
+        /* phase：当前正弦轨迹相位。*/
         const double phase =
             2.0 * kPi *
             static_cast<double>(control.motion_cycles % kMotionPeriodCycles) /
             static_cast<double>(kMotionPeriodCycles);
+        /* ramp：启动包络，避免刚进入运动时目标位置突变。*/
         const double ramp =
             std::min(1.0,
                      static_cast<double>(control.motion_cycles) /
                          static_cast<double>(kMotionRampCycles));
+        /* offset：相对 base_position 的本周期目标位置偏移。*/
         const int32_t offset = static_cast<int32_t>(
             std::sin(phase) * static_cast<double>(kMotionAmplitudeCounts) *
             ramp);
@@ -394,6 +489,7 @@ void update_motion_servo_control(App &app, ServoMotionControl &control) {
     }
 }
 
+/* 写入本周期全部输出 PDO：前 5 轴清零，第 6 轴执行控制状态机，EndIO 清零。*/
 void write_cycle_outputs(App &app, ServoMotionControl &control) {
     for (std::size_t i = 0; i < kServoCount; ++i) {
         if (i != kMotionServoIndex) {
@@ -404,6 +500,11 @@ void write_cycle_outputs(App &app, ServoMotionControl &control) {
     zero_endio_output(app.endio_rx);
 }
 
+/*
+ * 更新周期时间质量统计。
+ *
+ * now_ns：当前单调时间，单位 ns。
+ */
 void quality_update_cycle(QualityStats &stats, int64_t now_ns) {
     ++stats.cycles;
     if (stats.start_time_ns == 0) {
@@ -412,7 +513,9 @@ void quality_update_cycle(QualityStats &stats, int64_t now_ns) {
         return;
     }
 
+    /* interval_ns：本周期和上一周期之间的真实调度间隔。*/
     const int64_t interval_ns = now_ns - stats.last_cycle_time_ns;
+    /* jitter_ns：相对标称 1 ms 的绝对抖动。*/
     const int64_t jitter_ns =
         std::llabs(interval_ns - static_cast<int64_t>(kCycleTimeNs));
     stats.last_cycle_time_ns = now_ns;
@@ -427,6 +530,12 @@ void quality_update_cycle(QualityStats &stats, int64_t now_ns) {
     }
 }
 
+/*
+ * 更新 WKC 质量统计。
+ *
+ * wkc：本周期收到的 Working Counter。
+ * expected_wkc：PDO 映射后计算出的期望 WKC。
+ */
 void quality_update_wkc(QualityStats &stats, int wkc, int expected_wkc) {
     if (wkc == expected_wkc) {
         ++stats.good_wkc_cycles;
@@ -440,12 +549,17 @@ void quality_update_wkc(QualityStats &stats, int wkc, int expected_wkc) {
     stats.max_wkc = std::max(stats.max_wkc, wkc);
 }
 
+/*
+ * OP 后更新通信质量统计。
+ *
+ * 启动阶段 INIT/PREOP/SAFEOP 的 PDO 交换不计入最终运行质量。
+ */
 bool quality_update_after_op(App &app,
                              QualityStats &stats,
                              int64_t now_ns,
                              int wkc) {
     if (!stats.active) {
-        if (!all_slaves_operational(app)) {
+        if (!app.in_op) {
             return false;
         }
         stats.active = true;
@@ -458,10 +572,17 @@ bool quality_update_after_op(App &app,
     return true;
 }
 
+/*
+ * 打印通信质量报告。
+ *
+ * final_report：true 表示 Ctrl+C 退出时的最终报告。
+ */
 void print_quality_report(App &app,
                           const QualityStats &stats,
                           bool final_report) {
+    /* title：报告标题，区分周期报告和退出最终报告。*/
     const char *title = final_report ? "Ctrl+C final" : "periodic";
+    /* avg_period_us/avg_jitter_us：运行期平均周期和平均绝对抖动。*/
     const double avg_period_us =
         stats.interval_samples > 0
             ? ns_to_us(static_cast<int64_t>(stats.cycle_time_sum_ns /
@@ -472,11 +593,13 @@ void print_quality_report(App &app,
             ? ns_to_us(static_cast<int64_t>(stats.jitter_abs_sum_ns /
                                             stats.interval_samples))
             : 0.0;
+    /* success_rate：WKC 完整周期占比。*/
     const double success_rate =
         stats.cycles > 0
             ? static_cast<double>(stats.good_wkc_cycles) * 100.0 /
                   static_cast<double>(stats.cycles)
             : 0.0;
+    /* dc_avg_abs_us：DC PI 同步误差的平均绝对值。*/
     const double dc_avg_abs_us =
         stats.dc_valid_samples > 0
             ? ns_to_us(static_cast<int64_t>(stats.dc_abs_sum_ns /
@@ -541,6 +664,11 @@ void print_quality_report(App &app,
     std::printf("============================================================\n");
 }
 
+/*
+ * 校验从站 Vendor/ProductCode。
+ *
+ * 只打印 warning，不中断运行，方便现场在设备信息不一致时继续排查。
+ */
 void validate_slave_identity(App &app) {
     for (std::size_t i = 0; i < kServoCount; ++i) {
         const ec_slavet &slave = app.context.slavelist[i + 1];
@@ -568,9 +696,95 @@ void validate_slave_identity(App &app) {
     }
 }
 
+void print_mailbox_config(const App &app, const char *stage) {
+    std::printf("[MBX] %s\n", stage);
+    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
+        const ec_slavet &item = app.context.slavelist[slave];
+        std::printf("[MBX] slave=%d product=0x%08X state=0x%02X "
+                    "wo=0x%04X wl=%u ro=0x%04X rl=%u proto=0x%04X "
+                    "coe=0x%02X sm0=0x%04X/%u sm1=0x%04X/%u\n",
+                    slave,
+                    item.eep_id,
+                    item.state,
+                    item.mbx_wo,
+                    item.mbx_l,
+                    item.mbx_ro,
+                    item.mbx_rl,
+                    item.mbx_proto,
+                    item.CoEdetails,
+                    etohs(item.SM[0].StartAddr),
+                    etohs(item.SM[0].SMlength),
+                    etohs(item.SM[1].StartAddr),
+                    etohs(item.SM[1].SMlength));
+    }
+}
+
+bool is_siasun_mailbox_slave(const ec_slavet &slave) {
+    return slave.eep_man == kVendorId &&
+           (slave.eep_id == kServoProductCode ||
+            slave.eep_id == kEndIoProductCode);
+}
+
+int configure_siasun_mailboxes(App &app) {
+    print_mailbox_config(app, "after ecx_config_init");
+    if (!request_state(&app.context, EC_STATE_INIT, "INIT for mailbox setup")) {
+        return -1;
+    }
+
+    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
+        ec_slavet &item = app.context.slavelist[slave];
+        if (!is_siasun_mailbox_slave(item)) {
+            continue;
+        }
+
+        item.mbx_wo = kMailboxOutStart;
+        item.mbx_l = kMailboxSize;
+        item.mbx_ro = kMailboxInStart;
+        item.mbx_rl = kMailboxSize;
+        item.mbx_proto |= ECT_MBXPROT_COE;
+        item.CoEdetails |= ECT_COEDET_SDO | ECT_COEDET_PDOASSIGN |
+                            ECT_COEDET_PDOCONFIG;
+        item.SMtype[0] = 1;
+        item.SMtype[1] = 2;
+        item.SM[0].StartAddr = htoes(kMailboxOutStart);
+        item.SM[0].SMlength = htoes(kMailboxSize);
+        item.SM[0].SMflags = htoel(kMailboxOutFlags);
+        item.SM[1].StartAddr = htoes(kMailboxInStart);
+        item.SM[1].SMlength = htoes(kMailboxSize);
+        item.SM[1].SMflags = htoel(kMailboxInFlags);
+
+        const int wkc = ecx_FPWR(&app.context.port,
+                                 item.configadr,
+                                 ECT_REG_SM0,
+                                 sizeof(ec_smt) * 2,
+                                 &item.SM[0],
+                                 EC_TIMEOUTRET3);
+        std::printf("[MBX] slave=%d force mailbox SM0/SM1 wkc=%d\n",
+                    slave,
+                    wkc);
+        if (wkc <= 0) {
+            std::fprintf(stderr,
+                         "failed to configure mailbox SM for slave %d\n",
+                         slave);
+            return -1;
+        }
+    }
+
+    print_mailbox_config(app, "after SIASUN mailbox setup");
+    return request_state(&app.context, EC_STATE_PRE_OP, "PRE_OP") ? 0 : -1;
+}
+
+/*
+ * 从 SOEM slavelist 中取出每个从站的 PDO 输入输出指针。
+ *
+ * 必须在 ecx_config_map_group() 之后调用，此时 outputs/inputs 才指向 IOmap。
+ */
 int assign_pdo_pointers(App &app) {
     for (std::size_t i = 0; i < kServoCount; ++i) {
+        /* slave：SOEM 1-based 从站编号。*/
         const int slave = static_cast<int>(i + 1);
+        const int obytes = app.context.slavelist[slave].Obytes;
+        const int ibytes = app.context.slavelist[slave].Ibytes;
         app.servo_rx[i] =
             reinterpret_cast<ServoRxPdo *>(app.context.slavelist[slave].outputs);
         app.servo_tx[i] =
@@ -580,9 +794,18 @@ int assign_pdo_pointers(App &app) {
             return -1;
         }
         std::printf("[PDO] Servo %zu out=%d bytes in=%d bytes\n",
-                    i + 1,
-                    app.context.slavelist[slave].Obytes,
-                    app.context.slavelist[slave].Ibytes);
+                     i + 1,
+                     obytes,
+                     ibytes);
+        if (obytes != static_cast<int>(sizeof(ServoRxPdo)) ||
+            ibytes != static_cast<int>(sizeof(ServoTxPdo))) {
+            std::fprintf(stderr,
+                         "warning: Servo %zu PDO size mismatch, expected "
+                         "out=%zu in=%zu bytes\n",
+                         i + 1,
+                         sizeof(ServoRxPdo),
+                         sizeof(ServoTxPdo));
+        }
     }
 
     app.endio_rx = reinterpret_cast<EndIoRxPdo *>(
@@ -596,13 +819,36 @@ int assign_pdo_pointers(App &app) {
     std::printf("[PDO] EndIO out=%d bytes in=%d bytes\n",
                 app.context.slavelist[kEndIoLogicalId].Obytes,
                 app.context.slavelist[kEndIoLogicalId].Ibytes);
+    if (app.context.slavelist[kEndIoLogicalId].Obytes !=
+            static_cast<int>(sizeof(EndIoRxPdo)) ||
+        app.context.slavelist[kEndIoLogicalId].Ibytes !=
+            static_cast<int>(sizeof(EndIoTxPdo))) {
+        std::fprintf(stderr,
+                     "warning: EndIO PDO size mismatch, expected out=%zu "
+                     "in=%zu bytes\n",
+                     sizeof(EndIoRxPdo),
+                     sizeof(EndIoTxPdo));
+    }
     return 0;
 }
 
+/*
+ * SOEM 实时通信线程。
+ *
+ * 线程职责：
+ * - 按 1 ms 周期收发 process data。
+ * - 使用 DC PI 修正本机唤醒时间。
+ * - 周期性写入第 6 轴运动控制 PDO。
+ * - 调用 ecx_mbxhandler() 处理周期 mailbox。
+ */
 OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
+    /* app：由 osal_thread_create_rt() 传入的主站运行期上下文。*/
     App *app = static_cast<App *>(arg);
+    /* wakeup：下一次周期唤醒的绝对单调时间。*/
     ec_timet wakeup {};
+    /* time_offset_ns：DC PI 算法输出的唤醒修正量。*/
     int64_t time_offset_ns = 0;
+    /* cycle：RT 线程周期计数，用于低频报告节拍。*/
     uint64_t cycle = 0;
 
     while (!app->mapping_done && app->run) {
@@ -655,7 +901,13 @@ OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
     }
 }
 
+/*
+ * SOEM 状态检查线程。
+ *
+ * 当 WKC 连续异常或 group 要求检查状态时，尝试将异常从站恢复到 OP。
+ */
 OSAL_THREAD_FUNC ecatcheck(void *arg) {
+    /* app：由 osal_thread_create() 传入的主站运行期上下文。*/
     App *app = static_cast<App *>(arg);
 
     while (app->run) {
@@ -668,6 +920,7 @@ OSAL_THREAD_FUNC ecatcheck(void *arg) {
 
             for (int slave_index = 1; slave_index <= app->context.slavecount;
                  ++slave_index) {
+                /* slave：当前检查的 SOEM 从站状态对象。*/
                 ec_slavet *slave = &app->context.slavelist[slave_index];
                 if (slave->group == app->current_group &&
                     slave->state != EC_STATE_OPERATIONAL) {
@@ -763,7 +1016,11 @@ int configure(App &app,
     }
 
     validate_slave_identity(app);
+    if (configure_siasun_mailboxes(app)) {
+        return -1;
+    }
 
+    /* axis_parameters：从 Axis1.xml-Axis6.xml 读取出的 6 轴参数。*/
     AxisParameterSet axis_parameters;
     if (load_axis_parameter_set(axis_config_directory, axis_parameters) ||
         write_axis_parameters(&app.context, axis_parameters)) {

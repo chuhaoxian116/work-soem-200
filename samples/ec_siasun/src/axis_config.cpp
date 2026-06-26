@@ -9,11 +9,23 @@
 namespace siasun {
 namespace {
 
+/*
+ * 判断路径是否为可访问目录。
+ *
+ * path：待检查路径。
+ */
 bool is_directory(const std::string &path) {
+    /* st：stat() 填充的文件系统状态。*/
     struct stat st {};
     return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/*
+ * 拼接目录和文件名。
+ *
+ * directory：目录路径。
+ * filename：文件名。
+ */
 std::string join_path(const std::string &directory,
                       const std::string &filename) {
     if (directory.empty() || directory.back() == '/' ||
@@ -23,8 +35,15 @@ std::string join_path(const std::string &directory,
     return directory + "/" + filename;
 }
 
+/*
+ * 解析单个 ServoParameters XML 节点。
+ *
+ * element：tinyxml2 定位到的 ServoParameters 节点。
+ * parameter：输出参数对象。
+ */
 bool parse_servo_parameter(const tinyxml2::XMLElement *element,
                            ServoParameter &parameter) {
+    /* id_node/name_node/value_node/qfmt_node：Axis XML 中的四个业务字段。*/
     const tinyxml2::XMLElement *id_node = element->FirstChildElement("Id");
     const tinyxml2::XMLElement *name_node = element->FirstChildElement("Name");
     const tinyxml2::XMLElement *value_node = element->FirstChildElement("Value");
@@ -45,10 +64,18 @@ bool parse_servo_parameter(const tinyxml2::XMLElement *element,
     return true;
 }
 
+/*
+ * 解析单个 Axis*.xml 文件。
+ *
+ * path：Axis XML 文件路径。
+ * parameters：输出该轴参数列表。
+ */
 int load_axis_file(const std::string &path, AxisParameters &parameters) {
     std::printf("[XML] loading axis parameter file: %s\n", path.c_str());
 
+    /* doc：tinyxml2 XML 文档对象。*/
     tinyxml2::XMLDocument doc;
+    /* load_result：tinyxml2 文件加载结果。*/
     const tinyxml2::XMLError load_result = doc.LoadFile(path.c_str());
     if (load_result != tinyxml2::XML_SUCCESS) {
         std::fprintf(stderr, "failed to load %s: %s\n", path.c_str(),
@@ -56,13 +83,16 @@ int load_axis_file(const std::string &path, AxisParameters &parameters) {
         return -1;
     }
 
+    /* root：Axis XML 根节点 dataentry。*/
     const tinyxml2::XMLElement *root = doc.FirstChildElement("dataentry");
     if (!root) {
         std::fprintf(stderr, "missing dataentry root in %s\n", path.c_str());
         return -1;
     }
 
+    /* total_count：遍历到的 ServoParameters 节点总数。*/
     std::size_t total_count = 0;
+    /* skipped_count：字段缺失或 id<0 被跳过的节点数。*/
     std::size_t skipped_count = 0;
     for (const tinyxml2::XMLElement *element =
              root->FirstChildElement("ServoParameters");
@@ -102,6 +132,7 @@ int load_axis_file(const std::string &path, AxisParameters &parameters) {
 
 int resolve_axis_config_directory(const std::string &requested_directory,
                                   std::string &selected_directory) {
+    /* candidates：按优先级尝试的 Axis*.xml 目录。*/
     std::vector<std::string> candidates;
     if (!requested_directory.empty()) {
         candidates.push_back(requested_directory);
@@ -111,6 +142,7 @@ int resolve_axis_config_directory(const std::string &requested_directory,
     }
 
     for (const auto &candidate : candidates) {
+        /* axis1_path：用 Axis1.xml 验证目录是否可用。*/
         const std::string axis1_path = join_path(candidate, "Axis1.xml");
         std::printf("[XML] checking Axis*.xml directory: %s\n",
                     candidate.c_str());
@@ -134,6 +166,7 @@ int resolve_axis_config_directory(const std::string &requested_directory,
 int load_axis_parameter_set(const std::string &directory,
                             AxisParameterSet &parameters) {
     for (std::size_t axis = 0; axis < kServoCount; ++axis) {
+        /* filename：当前轴对应的 Axis*.xml 文件名。*/
         const std::string filename = "Axis" + std::to_string(axis + 1) + ".xml";
         if (load_axis_file(join_path(directory, filename), parameters[axis])) {
             return -1;
