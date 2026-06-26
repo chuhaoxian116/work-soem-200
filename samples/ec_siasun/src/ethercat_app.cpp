@@ -20,18 +20,16 @@ namespace {
 constexpr int kSafeOpWarmupCycles = 300;
 /* 每次 SDO 写入后的等待时间，给从站 mailbox 处理留出余量。*/
 constexpr int kPostSdoDelayUs = 10000;
+/* PDO remap 每次 SDO 失败后的重试间隔。*/
+constexpr int kPdoSdoRetryDelayUs = 20000;
+/* XML 参数 apply 后，给伺服内部更新参数的等待时间。*/
+constexpr int kPostParameterApplyDelayUs = 200000;
 /* SOEM check 线程中重配置/恢复从站使用的超时时间，单位 us。*/
 constexpr int kEthercatMonitorTimeoutUs = 500;
 /* 严重超周期阈值；超过 150% 标称周期计入 severe_overruns。*/
 constexpr uint64_t kCycleOverrunLimitNs =
     static_cast<uint64_t>(kCycleTimeNs * 3 / 2);
 constexpr double kPi = 3.14159265358979323846;
-/* SIASUN ESI 中的 mailbox SM0/SM1 配置；IgH 能正常下参时使用的也是这组 mailbox。*/
-constexpr uint16_t kMailboxOutStart = 0x1000;
-constexpr uint16_t kMailboxInStart = 0x1080;
-constexpr uint16_t kMailboxSize = 0x0080;
-constexpr uint32_t kMailboxOutFlags = 0x00010026;
-constexpr uint32_t kMailboxInFlags = 0x00010022;
 
 /* 第 6 轴 CiA402 使能和运动状态机。*/
 enum class ServoControlState {
@@ -185,25 +183,183 @@ int sdo_write(ecx_contextt *context,
               uint8_t subindex,
               const void *data,
               int size) {
-    const int wkc = ecx_SDOwrite(context,
-                                 slave,
-                                 index,
-                                 subindex,
-                                 FALSE,
-                                 size,
-                                 data,
-                                 EC_TIMEOUTRXM);
+    int last_wkc = 0;
+    for (int retry = 0; retry < 3; ++retry) {
+        last_wkc = ecx_SDOwrite(context,
+                                slave,
+                                index,
+                                subindex,
+                                FALSE,
+                                size,
+                                data,
+                                EC_TIMEOUTRXM * 4);
+        if (last_wkc > 0) {
+            osal_usleep(kPostSdoDelayUs);
+            return 0;
+        }
+
+        ecx_readstate(context);
+        osal_usleep(kPdoSdoRetryDelayUs);
+    }
+
+    std::fprintf(stderr,
+                 "SDO write failed: slave=%u 0x%04X:%02X wkc=%d "
+                 "state=0x%02X AL=0x%04X %s\n",
+                 slave,
+                 index,
+                 subindex,
+                 last_wkc,
+                 context->slavelist[slave].state,
+                 context->slavelist[slave].ALstatuscode,
+                 ec_ALstatuscode2string(
+                     context->slavelist[slave].ALstatuscode));
+    return -1;
+}
+
+void print_soem_errors(ecx_contextt *context, const char *prefix) {
+    ec_errort error {};
+    while (ecx_poperror(context, &error)) {
+        std::fprintf(stderr,
+                     "%s SOEM error: slave=%u index=0x%04X:%02X type=%d "
+                     "abort=0x%08X\n",
+                     prefix,
+                     error.Slave,
+                     error.Index,
+                     error.SubIdx,
+                     static_cast<int>(error.Etype),
+                     static_cast<uint32_t>(error.AbortCode));
+    }
+}
+
+int sdo_read(ecx_contextt *context,
+             uint16_t slave,
+             uint16_t index,
+             uint8_t subindex,
+             void *data,
+             int size) {
+    int read_size = size;
+    const int wkc = ecx_SDOread(context,
+                                slave,
+                                index,
+                                subindex,
+                                FALSE,
+                                &read_size,
+                                data,
+                                EC_TIMEOUTRXM * 4);
     if (wkc <= 0) {
         std::fprintf(stderr,
-                     "SDO write failed: slave=%u 0x%04X:%02X wkc=%d\n",
+                     "SDO read failed: slave=%u 0x%04X:%02X wkc=%d "
+                     "size=%d state=0x%02X AL=0x%04X %s\n",
                      slave,
                      index,
                      subindex,
-                     wkc);
+                     wkc,
+                     read_size,
+                     context->slavelist[slave].state,
+                     context->slavelist[slave].ALstatuscode,
+                     ec_ALstatuscode2string(
+                         context->slavelist[slave].ALstatuscode));
+        print_soem_errors(context, "[PDO]");
         return -1;
     }
-    osal_usleep(kPostSdoDelayUs);
     return 0;
+}
+
+uint32_t pdo_mapping_word(const PdoEntry &entry) {
+    return (static_cast<uint32_t>(entry.index) << 16) |
+           (static_cast<uint32_t>(entry.subindex) << 8) |
+           entry.bits;
+}
+
+template <std::size_t N>
+bool pdo_mapping_matches(ecx_contextt *context,
+                         uint16_t slave,
+                         uint16_t pdo,
+                         const std::array<PdoEntry, N> &entries) {
+    uint8_t count = 0;
+    if (sdo_read(context, slave, pdo, 0x00, &count, sizeof(count))) {
+        return false;
+    }
+    if (count != entries.size()) {
+        std::fprintf(stderr,
+                     "[PDO] slave=%u 0x%04X current count=%u expected=%zu\n",
+                     slave,
+                     pdo,
+                     count,
+                     entries.size());
+        return false;
+    }
+
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        uint32_t raw = 0;
+        if (sdo_read(context,
+                     slave,
+                     pdo,
+                     static_cast<uint8_t>(i + 1),
+                     &raw,
+                     sizeof(raw))) {
+            return false;
+        }
+        const uint32_t current = etohl(raw);
+        const uint32_t expected = pdo_mapping_word(entries[i]);
+        if (current != expected) {
+            std::fprintf(stderr,
+                         "[PDO] slave=%u 0x%04X:%02zu current=0x%08X "
+                         "expected=0x%08X\n",
+                         slave,
+                         pdo,
+                         i + 1,
+                         current,
+                         expected);
+            return false;
+        }
+    }
+
+    std::printf("[PDO] slave=%u 0x%04X mapping already matches\n",
+                slave,
+                pdo);
+    return true;
+}
+
+bool pdo_assignment_matches(ecx_contextt *context,
+                            uint16_t slave,
+                            uint16_t assignment,
+                            uint16_t pdo_index) {
+    uint8_t count = 0;
+    if (sdo_read(context, slave, assignment, 0x00, &count, sizeof(count))) {
+        return false;
+    }
+    if (count != 1) {
+        std::fprintf(stderr,
+                     "[PDO] slave=%u 0x%04X current assign count=%u "
+                     "expected=1\n",
+                     slave,
+                     assignment,
+                     count);
+        return false;
+    }
+
+    uint16_t raw = 0;
+    if (sdo_read(context, slave, assignment, 0x01, &raw, sizeof(raw))) {
+        return false;
+    }
+    const uint16_t current = etohs(raw);
+    if (current != pdo_index) {
+        std::fprintf(stderr,
+                     "[PDO] slave=%u 0x%04X:01 current=0x%04X "
+                     "expected=0x%04X\n",
+                     slave,
+                     assignment,
+                     current,
+                     pdo_index);
+        return false;
+    }
+
+    std::printf("[PDO] slave=%u 0x%04X assignment already matches 0x%04X\n",
+                slave,
+                assignment,
+                pdo_index);
+    return true;
 }
 
 /*
@@ -217,9 +373,18 @@ int configure_pdo_mapping(ecx_contextt *context,
                           uint16_t slave,
                           uint16_t pdo,
                           const std::array<PdoEntry, N> &entries) {
+    /*
+     * 有些 SINSUN 从站的 PDO mapping 对象是只读的。
+     * 如果当前映射已经和程序期望一致，就不要再写 sub0，避免 0x06010002 日志刷屏。
+     */
+    if (pdo_mapping_matches(context, slave, pdo, entries)) {
+        return 0;
+    }
+
     /* zero：写入 sub0 清空映射表，符合 CoE PDO remap 标准流程。*/
     uint8_t zero = 0;
     if (sdo_write(context, slave, pdo, 0x00, &zero, sizeof(zero))) {
+        print_soem_errors(context, "[PDO]");
         return -1;
     }
 
@@ -237,12 +402,17 @@ int configure_pdo_mapping(ecx_contextt *context,
                       static_cast<uint8_t>(i + 1),
                       &mapping,
                       sizeof(mapping))) {
+            print_soem_errors(context, "[PDO]");
             return -1;
         }
     }
 
     const uint8_t count = static_cast<uint8_t>(entries.size());
-    return sdo_write(context, slave, pdo, 0x00, &count, sizeof(count));
+    if (sdo_write(context, slave, pdo, 0x00, &count, sizeof(count))) {
+        print_soem_errors(context, "[PDO]");
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -254,13 +424,28 @@ int assign_pdo(ecx_contextt *context,
                uint16_t slave,
                uint16_t assignment,
                uint16_t pdo_index) {
+    /*
+     * 同 mapping 一样，assignment 已经正确时直接跳过写入。
+     * 这样不会因为只读对象产生 0x06010002，同时仍能验证当前配置。
+     */
+    if (pdo_assignment_matches(context, slave, assignment, pdo_index)) {
+        return 0;
+    }
+
     /* zero/one：分别用于关闭和重新打开 SyncManager assignment。*/
     uint8_t zero = 0;
     uint8_t one = 1;
-    return sdo_write(context, slave, assignment, 0x00, &zero, sizeof(zero)) ||
-           sdo_write(context, slave, assignment, 0x01, &pdo_index,
-                     sizeof(pdo_index)) ||
-           sdo_write(context, slave, assignment, 0x00, &one, sizeof(one));
+    if (sdo_write(context, slave, assignment, 0x00, &zero, sizeof(zero))) {
+        print_soem_errors(context, "[PDO]");
+        return -1;
+    }
+    if (sdo_write(context, slave, assignment, 0x01, &pdo_index,
+                  sizeof(pdo_index)) ||
+        sdo_write(context, slave, assignment, 0x00, &one, sizeof(one))) {
+        print_soem_errors(context, "[PDO]");
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -321,6 +506,7 @@ bool request_state(ecx_contextt *context, uint16_t state, const char *name) {
     context->slavelist[0].state = state;
     ecx_writestate(context, 0);
     if (ecx_statecheck(context, 0, state, EC_TIMEOUTSTATE) == state) {
+        ecx_readstate(context);
         std::printf("%s OK\n", name);
         return true;
     }
@@ -719,59 +905,18 @@ void print_mailbox_config(const App &app, const char *stage) {
     }
 }
 
-bool is_siasun_mailbox_slave(const ec_slavet &slave) {
-    return slave.eep_man == kVendorId &&
-           (slave.eep_id == kServoProductCode ||
-            slave.eep_id == kEndIoProductCode);
+int prepare_mailboxes(App &app) {
+    print_mailbox_config(app, "after ecx_config_init");
+    return request_state(&app.context, EC_STATE_PRE_OP, "PRE_OP") ? 0 : -1;
 }
 
-int configure_siasun_mailboxes(App &app) {
-    print_mailbox_config(app, "after ecx_config_init");
-    if (!request_state(&app.context, EC_STATE_INIT, "INIT for mailbox setup")) {
-        return -1;
-    }
-
+void configure_distributed_clocks(App &app) {
+    ecx_configdc(&app.context);
     for (int slave = 1; slave <= app.context.slavecount; ++slave) {
-        ec_slavet &item = app.context.slavelist[slave];
-        if (!is_siasun_mailbox_slave(item)) {
-            continue;
-        }
-
-        item.mbx_wo = kMailboxOutStart;
-        item.mbx_l = kMailboxSize;
-        item.mbx_ro = kMailboxInStart;
-        item.mbx_rl = kMailboxSize;
-        item.mbx_proto |= ECT_MBXPROT_COE;
-        item.CoEdetails |= ECT_COEDET_SDO | ECT_COEDET_PDOASSIGN |
-                            ECT_COEDET_PDOCONFIG;
-        item.SMtype[0] = 1;
-        item.SMtype[1] = 2;
-        item.SM[0].StartAddr = htoes(kMailboxOutStart);
-        item.SM[0].SMlength = htoes(kMailboxSize);
-        item.SM[0].SMflags = htoel(kMailboxOutFlags);
-        item.SM[1].StartAddr = htoes(kMailboxInStart);
-        item.SM[1].SMlength = htoes(kMailboxSize);
-        item.SM[1].SMflags = htoel(kMailboxInFlags);
-
-        const int wkc = ecx_FPWR(&app.context.port,
-                                 item.configadr,
-                                 ECT_REG_SM0,
-                                 sizeof(ec_smt) * 2,
-                                 &item.SM[0],
-                                 EC_TIMEOUTRET3);
-        std::printf("[MBX] slave=%d force mailbox SM0/SM1 wkc=%d\n",
-                    slave,
-                    wkc);
-        if (wkc <= 0) {
-            std::fprintf(stderr,
-                         "failed to configure mailbox SM for slave %d\n",
-                         slave);
-            return -1;
+        if (app.context.slavelist[slave].hasdc) {
+            ecx_dcsync0(&app.context, slave, TRUE, kCycleTimeNs, 0);
         }
     }
-
-    print_mailbox_config(app, "after SIASUN mailbox setup");
-    return request_state(&app.context, EC_STATE_PRE_OP, "PRE_OP") ? 0 : -1;
 }
 
 /*
@@ -780,23 +925,58 @@ int configure_siasun_mailboxes(App &app) {
  * 必须在 ecx_config_map_group() 之后调用，此时 outputs/inputs 才指向 IOmap。
  */
 int assign_pdo_pointers(App &app) {
+    uint8_t *group_outputs = app.context.grouplist[0].outputs;
+    uint8_t *group_inputs = app.context.grouplist[0].inputs;
+    std::size_t output_offset = 0;
+    std::size_t input_offset = 0;
+
     for (std::size_t i = 0; i < kServoCount; ++i) {
         /* slave：SOEM 1-based 从站编号。*/
         const int slave = static_cast<int>(i + 1);
-        const int obytes = app.context.slavelist[slave].Obytes;
-        const int ibytes = app.context.slavelist[slave].Ibytes;
-        app.servo_rx[i] =
-            reinterpret_cast<ServoRxPdo *>(app.context.slavelist[slave].outputs);
-        app.servo_tx[i] =
-            reinterpret_cast<ServoTxPdo *>(app.context.slavelist[slave].inputs);
+        ec_slavet &item = app.context.slavelist[slave];
+        const int obytes = item.Obytes;
+        const int ibytes = item.Ibytes;
+
+        uint8_t *outputs = item.outputs;
+        uint8_t *inputs = item.inputs;
+
+        /*
+         * 正常情况下 SOEM 会填充 slavelist[slave].outputs/inputs。
+         * 如果现场 SOEM 版本没有填充单从站指针，则按 legacy 顺序从 group IOmap 回退计算。
+         */
+        if (!outputs && group_outputs && obytes > 0) {
+            outputs = group_outputs + output_offset;
+        }
+        if (!inputs && group_inputs && ibytes > 0) {
+            inputs = group_inputs + input_offset;
+        }
+
+        app.servo_rx[i] = reinterpret_cast<ServoRxPdo *>(outputs);
+        app.servo_tx[i] = reinterpret_cast<ServoTxPdo *>(inputs);
+
+        std::printf("[PDO] Servo %zu out=%d bytes in=%d bytes "
+                    "Obits=%d Ibits=%d outputs=%p inputs=%p\n",
+                    i + 1,
+                    obytes,
+                    ibytes,
+                    item.Obits,
+                    item.Ibits,
+                    static_cast<void *>(outputs),
+                    static_cast<void *>(inputs));
+
         if (!app.servo_rx[i] || !app.servo_tx[i]) {
-            std::fprintf(stderr, "servo %zu PDO pointers are NULL\n", i + 1);
+            std::fprintf(stderr,
+                         "servo %zu PDO pointers are NULL, "
+                         "group_outputs=%p group_inputs=%p output_offset=%zu "
+                         "input_offset=%zu\n",
+                         i + 1,
+                         static_cast<void *>(group_outputs),
+                         static_cast<void *>(group_inputs),
+                         output_offset,
+                         input_offset);
             return -1;
         }
-        std::printf("[PDO] Servo %zu out=%d bytes in=%d bytes\n",
-                     i + 1,
-                     obytes,
-                     ibytes);
+
         if (obytes != static_cast<int>(sizeof(ServoRxPdo)) ||
             ibytes != static_cast<int>(sizeof(ServoTxPdo))) {
             std::fprintf(stderr,
@@ -806,23 +986,43 @@ int assign_pdo_pointers(App &app) {
                          sizeof(ServoRxPdo),
                          sizeof(ServoTxPdo));
         }
+
+        output_offset += static_cast<std::size_t>(obytes);
+        input_offset += static_cast<std::size_t>(ibytes);
     }
 
-    app.endio_rx = reinterpret_cast<EndIoRxPdo *>(
-        app.context.slavelist[kEndIoLogicalId].outputs);
-    app.endio_tx = reinterpret_cast<EndIoTxPdo *>(
-        app.context.slavelist[kEndIoLogicalId].inputs);
+    ec_slavet &endio = app.context.slavelist[kEndIoLogicalId];
+    uint8_t *endio_outputs = endio.outputs;
+    uint8_t *endio_inputs = endio.inputs;
+    if (!endio_outputs && group_outputs && endio.Obytes > 0) {
+        endio_outputs = group_outputs + output_offset;
+    }
+    if (!endio_inputs && group_inputs && endio.Ibytes > 0) {
+        endio_inputs = group_inputs + input_offset;
+    }
+
+    app.endio_rx = reinterpret_cast<EndIoRxPdo *>(endio_outputs);
+    app.endio_tx = reinterpret_cast<EndIoTxPdo *>(endio_inputs);
     if (!app.endio_rx || !app.endio_tx) {
-        std::fprintf(stderr, "EndIO PDO pointers are NULL\n");
+        std::fprintf(stderr,
+                     "EndIO PDO pointers are NULL, group_outputs=%p "
+                     "group_inputs=%p output_offset=%zu input_offset=%zu\n",
+                     static_cast<void *>(group_outputs),
+                     static_cast<void *>(group_inputs),
+                     output_offset,
+                     input_offset);
         return -1;
     }
-    std::printf("[PDO] EndIO out=%d bytes in=%d bytes\n",
-                app.context.slavelist[kEndIoLogicalId].Obytes,
-                app.context.slavelist[kEndIoLogicalId].Ibytes);
-    if (app.context.slavelist[kEndIoLogicalId].Obytes !=
-            static_cast<int>(sizeof(EndIoRxPdo)) ||
-        app.context.slavelist[kEndIoLogicalId].Ibytes !=
-            static_cast<int>(sizeof(EndIoTxPdo))) {
+    std::printf("[PDO] EndIO out=%d bytes in=%d bytes Obits=%d Ibits=%d "
+                "outputs=%p inputs=%p\n",
+                endio.Obytes,
+                endio.Ibytes,
+                endio.Obits,
+                endio.Ibits,
+                static_cast<void *>(endio_outputs),
+                static_cast<void *>(endio_inputs));
+    if (endio.Obytes != static_cast<int>(sizeof(EndIoRxPdo)) ||
+        endio.Ibytes != static_cast<int>(sizeof(EndIoTxPdo))) {
         std::fprintf(stderr,
                      "warning: EndIO PDO size mismatch, expected out=%zu "
                      "in=%zu bytes\n",
@@ -1016,22 +1216,15 @@ int configure(App &app,
     }
 
     validate_slave_identity(app);
-    if (configure_siasun_mailboxes(app)) {
+    if (prepare_mailboxes(app)) {
         return -1;
     }
 
     /* axis_parameters：从 Axis1.xml-Axis6.xml 读取出的 6 轴参数。*/
     AxisParameterSet axis_parameters;
     if (load_axis_parameter_set(axis_config_directory, axis_parameters) ||
-        write_axis_parameters(&app.context, axis_parameters)) {
+        write_axis_parameters(&app.context, axis_parameters, false)) {
         return -1;
-    }
-
-    ecx_configdc(&app.context);
-    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
-        if (app.context.slavelist[slave].hasdc) {
-            ecx_dcsync0(&app.context, slave, TRUE, kCycleTimeNs, 0);
-        }
     }
 
     for (std::size_t i = 0; i < kServoCount; ++i) {
@@ -1042,6 +1235,15 @@ int configure(App &app,
     if (configure_endio_pdos(&app.context, kEndIoLogicalId)) {
         return -1;
     }
+
+    // if (apply_axis_parameters(&app.context)) {
+    //     return -1;
+    // }
+    std::printf("[SDO] waiting for parameter apply before SAFE_OP\n");
+    osal_usleep(kPostParameterApplyDelayUs);
+    ecx_readstate(&app.context);
+
+    configure_distributed_clocks(app);
 
     std::fill(app.io_map.begin(), app.io_map.end(), 0);
     ecx_config_map_group(&app.context, app.io_map.data(), 0);

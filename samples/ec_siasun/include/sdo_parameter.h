@@ -15,7 +15,15 @@ namespace siasun {
  * parameters：6 个轴的参数集合。
  */
 int write_axis_parameters(ecx_contextt *context,
-                          const AxisParameterSet &parameters);
+                          const AxisParameterSet &parameters,
+                          bool apply_downloaded_parameters = true);
+
+/*
+ * 对 1-6 号伺服统一写入 tRequestParaFlag=1，使已下载参数生效。
+ *
+ * context：SOEM 主站上下文。
+ */
+int apply_axis_parameters(ecx_contextt *context);
 
 /*
  * 将单个伺服参数按 SINSUN mailbox 协议写入指定从站。

@@ -45,6 +45,45 @@ uint32_t encode_parameter_value(double value, int qfmt) {
     return sign + scaled;
 }
 
+void print_mailbox_diagnostics(ecx_contextt *context, uint16_t slave) {
+    const ec_slavet &item = context->slavelist[slave];
+    uint8_t sm0_status = 0;
+    uint8_t sm1_status = 0;
+    const int sm0_wkc = ecx_FPRD(&context->port,
+                                 item.configadr,
+                                 ECT_REG_SM0STAT,
+                                 sizeof(sm0_status),
+                                 &sm0_status,
+                                 EC_TIMEOUTRET3);
+    const int sm1_wkc = ecx_FPRD(&context->port,
+                                 item.configadr,
+                                 ECT_REG_SM1STAT,
+                                 sizeof(sm1_status),
+                                 &sm1_status,
+                                 EC_TIMEOUTRET3);
+    const int empty = ecx_mbxempty(context, slave, EC_TIMEOUTTXM * 4);
+
+    std::fprintf(stderr,
+                 "[SDO-DIAG] slave=%u configadr=0x%04X state=0x%02X "
+                 "mbx_wo=0x%04X mbx_l=%u mbx_ro=0x%04X mbx_rl=%u "
+                 "proto=0x%04X coe=0x%02X sm0stat=0x%02X(wkc=%d) "
+                 "sm1stat=0x%02X(wkc=%d) mbxempty=%d\n",
+                 slave,
+                 item.configadr,
+                 item.state,
+                 item.mbx_wo,
+                 item.mbx_l,
+                 item.mbx_ro,
+                 item.mbx_rl,
+                 item.mbx_proto,
+                 item.CoEdetails,
+                 sm0_status,
+                 sm0_wkc,
+                 sm1_status,
+                 sm1_wkc,
+                 empty);
+}
+
 /*
  * 将 32-bit mailbox word 写到伺服 0x2020:00。
  *
@@ -59,6 +98,14 @@ int download_mailbox_word(ecx_contextt *context,
                           uint32_t word,
                           MailboxWordKind kind,
                           const ServoParameter &parameter) {
+    /* data：SDO download 的小端 4 字节 payload，对齐 IgH EC_WRITE_U32 行为。*/
+    const uint8_t data[4] {
+        static_cast<uint8_t>(word & 0xFFU),
+        static_cast<uint8_t>((word >> 8) & 0xFFU),
+        static_cast<uint8_t>((word >> 16) & 0xFFU),
+        static_cast<uint8_t>((word >> 24) & 0xFFU),
+    };
+
     if (kLogSdoDownloadDetails) {
         std::printf("[SDO] servo=%u param id=%d name=%s step=%s "
                     "download 0x2020:00 word=0x%08X\n",
@@ -76,8 +123,8 @@ int download_mailbox_word(ecx_contextt *context,
                                 0x2020,
                                 0x00,
                                 FALSE,
-                                sizeof(word),
-                                &word,
+                                sizeof(data),
+                                data,
                                 EC_TIMEOUTRXM * 4);
         if (last_wkc > 0) {
             osal_usleep(10000);
@@ -87,6 +134,7 @@ int download_mailbox_word(ecx_contextt *context,
     }
 
     ecx_readstate(context);
+    print_mailbox_diagnostics(context, slave);
     std::fprintf(stderr,
                  "SDO download failed: slave=%u state=0x%02X AL=0x%04X "
                  "word=0x%08X wkc=%d\n",
@@ -124,8 +172,24 @@ int write_servo_parameter(ecx_contextt *context,
     return 0;
 }
 
+int apply_axis_parameters(ecx_contextt *context) {
+    /* apply_parameter：id=2,value=1,qFmt=0，用于使能已下载参数。*/
+    const ServoParameter apply_parameter{2, "tRequestParaFlag", 1.0, 0};
+    for (std::size_t axis = 0; axis < kServoCount; ++axis) {
+        const uint16_t slave = static_cast<uint16_t>(axis + 1);
+        std::printf("[SDO] servo %zu applying downloaded parameters\n",
+                    axis + 1);
+        if (write_servo_parameter(context, slave, apply_parameter)) {
+            return -1;
+        }
+    }
+    std::printf("[SDO] all servo SDO parameters applied successfully\n");
+    return 0;
+}
+
 int write_axis_parameters(ecx_contextt *context,
-                          const AxisParameterSet &parameters) {
+                          const AxisParameterSet &parameters,
+                          bool apply_downloaded_parameters) {
     for (std::size_t axis = 0; axis < kServoCount; ++axis) {
         /* slave：SOEM 1-based 从站编号，axis 0-5 对应 slave 1-6。*/
         const uint16_t slave = static_cast<uint16_t>(axis + 1);
@@ -146,17 +210,12 @@ int write_axis_parameters(ecx_contextt *context,
                 return -1;
             }
         }
-
-        /* apply_parameter：id=2,value=1,qFmt=0，用于使能已下载参数。*/
-        const ServoParameter apply_parameter{2, "tRequestParaFlag", 1.0, 0};
-        std::printf("[SDO] servo %zu applying downloaded parameters\n",
-                    axis + 1);
-        if (write_servo_parameter(context, slave, apply_parameter)) {
-            return -1;
-        }
     }
 
-    std::printf("[SDO] all servo SDO parameters written successfully\n");
+    std::printf("[SDO] all servo XML parameters downloaded successfully\n");
+    if (apply_downloaded_parameters) {
+        return apply_axis_parameters(context);
+    }
     return 0;
 }
 
