@@ -207,10 +207,45 @@ void print_process_data_sm_config(const App &app, const char *stage) {
  */
 bool request_state(ecx_contextt *context, uint16_t state, const char *name) {
     context->slavelist[0].state = state;
-    ecx_writestate(context, 0);
+    const int broadcast_wkc = ecx_writestate(context, 0);
+    std::printf("[STATE] request %s broadcast wkc=%d\n",
+                name,
+                broadcast_wkc);
     if (ecx_statecheck(context, 0, state, EC_TIMEOUTSTATE) == state) {
         ecx_readstate(context);
         std::printf("%s OK\n", name);
+        return true;
+    }
+
+    ecx_readstate(context);
+    bool retried = false;
+    for (int slave = 1; slave <= context->slavecount; ++slave) {
+        if ((context->slavelist[slave].state & 0x0FU) ==
+            (state & 0x0FU)) {
+            continue;
+        }
+
+        retried = true;
+        const uint16_t previous_state = context->slavelist[slave].state;
+        context->slavelist[slave].state = state;
+        const int retry_wkc = ecx_writestate(context, slave);
+        const uint16_t reached =
+            ecx_statecheck(context, slave, state, EC_TIMEOUTSTATE);
+        std::printf("[STATE] slave=%d %s retry: previous=0x%02X "
+                    "write_wkc=%d reached=0x%02X AL=0x%04X\n",
+                    slave,
+                    name,
+                    static_cast<unsigned int>(previous_state),
+                    retry_wkc,
+                    static_cast<unsigned int>(reached),
+                    static_cast<unsigned int>(
+                        context->slavelist[slave].ALstatuscode));
+    }
+
+    if (retried &&
+        ecx_statecheck(context, 0, state, EC_TIMEOUTSTATE) == state) {
+        ecx_readstate(context);
+        std::printf("%s OK after individual retry\n", name);
         return true;
     }
 
@@ -615,11 +650,26 @@ int prepare_mailboxes(App &app) {
 
 void configure_distributed_clocks(App &app) {
     ecx_configdc(&app.context);
-    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
+
+    /*
+     * 和 IgH 版本保持一致：只有 1-6 号伺服使用 DC Sync0。
+     * EndIO 使用 ESI 中 AssignActivate=0 的 SM 同步模式。
+     */
+    for (int slave = 1; slave <= static_cast<int>(kServoCount); ++slave) {
         if (app.context.slavelist[slave].hasdc) {
             ecx_dcsync0(&app.context, slave, TRUE, kCycleTimeNs, 0);
+            std::printf("[DC] servo=%d Sync0 enabled, cycle=%lld ns\n",
+                        slave,
+                        static_cast<long long>(kCycleTimeNs));
         }
     }
+
+    ec_slavet &endio = app.context.slavelist[kEndIoLogicalId];
+    if (endio.hasdc) {
+        ecx_dcsync0(&app.context, kEndIoLogicalId, FALSE, 0, 0);
+    }
+    std::printf("[DC] EndIO=%u uses SM synchronization, Sync0 disabled\n",
+                static_cast<unsigned int>(kEndIoLogicalId));
 }
 
 /*
@@ -943,6 +993,9 @@ int configure(App &app,
         app.last_wkc = ecx_receive_processdata(&app.context, EC_TIMEOUTRET);
         osal_usleep(kCycleTimeNs / 1000);
     }
+    std::printf("[PDO] SAFE_OP warmup lastWKC=%d expectedWKC=%d\n",
+                app.last_wkc,
+                app.expected_wkc);
     write_default_outputs(app);
     for (int i = 0; i < 50; ++i) {
         ecx_send_processdata(&app.context);
@@ -959,6 +1012,9 @@ int configure(App &app,
     app.mapping_done = 1;
     app.do_run = 1;
     osal_usleep(300000);
+    std::printf("[PDO] before OP lastWKC=%d expectedWKC=%d\n",
+                app.last_wkc,
+                app.expected_wkc);
 
     if (!request_state(&app.context, EC_STATE_OPERATIONAL, "OPERATIONAL")) {
         return -1;
