@@ -25,6 +25,8 @@ constexpr int kEthercatMonitorTimeoutUs = 500;
 /* 严重超周期阈值；超过 150% 标称周期计入 severe_overruns。*/
 constexpr uint64_t kCycleOverrunLimitNs =
     static_cast<uint64_t>(kCycleTimeNs * 3 / 2);
+/* DC 质量每 1000 个运行周期采样一次，和 IgH 报告口径一致。*/
+constexpr uint64_t kDcMonitorPeriodCycles = 1000;
 constexpr double kPi = 3.14159265358979323846;
 
 /* 第 6 轴 CiA402 使能和运动状态机。*/
@@ -65,6 +67,7 @@ struct QualityStats {
     int min_wkc = INT_MAX;
     int max_wkc = INT_MIN;
     uint64_t dc_valid_samples = 0;
+    uint64_t dc_invalid_samples = 0;
     uint64_t dc_abs_sum_ns = 0;
     int64_t dc_time_error_ns = 0;
     int64_t max_dc_diff_ns = 0;
@@ -139,7 +142,8 @@ void prefault_stack() {
 void ec_sync(int64 reftime,
              int64 cycletime_ns,
              int64 *offsettime,
-             QualityStats &stats) {
+             QualityStats &stats,
+             bool record_sample) {
     /* integral：PI 控制器积分项，跨周期累计 DC 时间误差。*/
     static int64 integral = 0;
     constexpr double kProportionalGain = 0.01;
@@ -153,16 +157,19 @@ void ec_sync(int64 reftime,
         delta += cycletime_ns;
     }
 
-    stats.dc_time_error_ns = -delta;
-    const int64_t abs_error = std::llabs(stats.dc_time_error_ns);
-    ++stats.dc_valid_samples;
-    stats.dc_abs_sum_ns += static_cast<uint64_t>(abs_error);
-    stats.max_dc_diff_ns = std::max(stats.max_dc_diff_ns, abs_error);
-
-    integral += stats.dc_time_error_ns;
+    const int64_t sync_error_ns = -delta;
+    integral += sync_error_ns;
     *offsettime = static_cast<int64>(
-        (static_cast<double>(stats.dc_time_error_ns) * kProportionalGain) +
+        (static_cast<double>(sync_error_ns) * kProportionalGain) +
         (static_cast<double>(integral) * kIntegralGain));
+
+    if (record_sample) {
+        stats.dc_time_error_ns = sync_error_ns;
+        const int64_t abs_error = std::llabs(sync_error_ns);
+        ++stats.dc_valid_samples;
+        stats.dc_abs_sum_ns += static_cast<uint64_t>(abs_error);
+        stats.max_dc_diff_ns = std::max(stats.max_dc_diff_ns, abs_error);
+    }
 }
 
 /*
@@ -486,9 +493,16 @@ bool quality_update_after_op(App &app,
         if (!app.in_op) {
             return false;
         }
+
+        stats = QualityStats {};
         stats.active = true;
-        std::printf("communication quality statistics started: all 7 "
-                    "slaves are OP\n");
+        stats.start_time_ns = now_ns;
+        stats.last_cycle_time_ns = now_ns;
+        stats.cycles = 1;
+        quality_update_wkc(stats, wkc, app.expected_wkc);
+        std::printf("[QUALITY] 全部 7 个从站进入 OP，"
+                    "开始控制并记录通信/DC 质量\n");
+        return true;
     }
 
     quality_update_cycle(stats, now_ns);
@@ -504,9 +518,7 @@ bool quality_update_after_op(App &app,
 void print_quality_report(App &app,
                           const QualityStats &stats,
                           bool final_report) {
-    /* title：报告标题，区分周期报告和退出最终报告。*/
-    const char *title = final_report ? "Ctrl+C final" : "periodic";
-    /* avg_period_us/avg_jitter_us：运行期平均周期和平均绝对抖动。*/
+    /* avg_period_us/avg_jitter_us：OP 运行期平均周期和平均绝对抖动。*/
     const double avg_period_us =
         stats.interval_samples > 0
             ? ns_to_us(static_cast<int64_t>(stats.cycle_time_sum_ns /
@@ -529,62 +541,147 @@ void print_quality_report(App &app,
             ? ns_to_us(static_cast<int64_t>(stats.dc_abs_sum_ns /
                                             stats.dc_valid_samples))
             : 0.0;
+    /* runtime_s：从全部从站进入 OP 后开始计算的有效运行时长。*/
+    const double runtime_s =
+        stats.active && stats.last_cycle_time_ns >= stats.start_time_ns
+            ? static_cast<double>(stats.last_cycle_time_ns -
+                                  stats.start_time_ns) /
+                  1000000000.0
+            : 0.0;
+
+    int online_count = 0;
+    int operational_count = 0;
+    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
+        const uint16_t state = app.context.slavelist[slave].state & 0x0FU;
+        if (state != EC_STATE_NONE) {
+            ++online_count;
+        }
+        if (state == EC_STATE_OPERATIONAL) {
+            ++operational_count;
+        }
+    }
+    const bool link_ok =
+        app.last_wkc > 0 && online_count == app.context.slavecount;
+    const int domain_state =
+        app.last_wkc == app.expected_wkc ? 2 : (app.last_wkc > 0 ? 1 : 0);
 
     std::printf("\n============================================================\n");
-    std::printf("              SOEM communication quality report: %s\n", title);
+    std::printf("%s",
+                final_report
+                    ? "              SOEM 通信质量报告（Ctrl+C 最终汇总）\n"
+                    : "                 SOEM 通信质量报告（周期汇总）\n");
     std::printf("============================================================\n");
     if (!stats.active) {
-        std::printf("all slaves did not reach OP; no runtime samples\n");
+        std::printf("  尚未进入全部从站 OP 状态，未记录运行质量数据。\n");
         std::printf("============================================================\n");
         return;
     }
 
-    std::printf("  cycles               : %12llu\n",
+    std::printf("[运行概况]\n");
+    std::printf("  运行时长          : %12.3f s\n", runtime_s);
+    std::printf("  累计周期          : %12llu\n",
                 static_cast<unsigned long long>(stats.cycles));
-    std::printf("  nominal period       : %12.3f us\n",
+    std::printf("  标称通信周期      : %12.3f us\n",
                 ns_to_us(kCycleTimeNs));
-    std::printf("  avg period           : %12.3f us\n", avg_period_us);
-    std::printf("  min / max period     : %12.3f / %.3f us\n",
+
+    std::printf("[周期质量]\n");
+    std::printf("  平均实际周期      : %12.3f us\n", avg_period_us);
+    std::printf("  最小 / 最大周期   : %12.3f / %.3f us\n",
                 stats.interval_samples ? ns_to_us(stats.min_cycle_ns) : 0.0,
                 stats.interval_samples ? ns_to_us(stats.max_cycle_ns) : 0.0);
-    std::printf("  avg abs jitter       : %12.3f us\n", avg_jitter_us);
-    std::printf("  max abs jitter       : %12.3f us\n",
+    std::printf("  平均绝对抖动      : %12.3f us\n", avg_jitter_us);
+    std::printf("  最大绝对抖动      : %12.3f us\n",
                 ns_to_us(stats.max_abs_jitter_ns));
-    std::printf("  severe overruns      : %12llu\n",
+    std::printf("  严重超周期次数    : %12llu  (> 150%% 标称周期)\n",
                 static_cast<unsigned long long>(stats.severe_overruns));
-    std::printf("  expected WKC         : %12d\n", app.expected_wkc);
-    std::printf("  good / bad cycles    : %12llu / %llu\n",
-                static_cast<unsigned long long>(stats.good_wkc_cycles),
-                static_cast<unsigned long long>(stats.bad_wkc_cycles));
-    std::printf("  no frame cycles      : %12llu\n",
-                static_cast<unsigned long long>(stats.no_frame_cycles));
-    std::printf("  success rate         : %12.6f %%\n", success_rate);
-    std::printf("  DC current / avg / max: %10.3f / %.3f / %.3f us\n",
-                ns_to_us(stats.dc_time_error_ns),
-                dc_avg_abs_us,
-                ns_to_us(stats.max_dc_diff_ns));
-    std::printf("  recovery events      : state=%llu reconfig=%llu recover=%llu\n",
-                static_cast<unsigned long long>(stats.state_error_events),
-                static_cast<unsigned long long>(stats.reconfiguration_events),
-                static_cast<unsigned long long>(stats.recovery_events));
 
+    std::printf("[Domain 过程数据质量]\n");
+    std::printf("  完整周期          : %12llu\n",
+                static_cast<unsigned long long>(stats.good_wkc_cycles));
+    std::printf("  不完整周期        : %12llu\n",
+                static_cast<unsigned long long>(stats.bad_wkc_cycles));
+    std::printf("  无过程数据周期    : %12llu\n",
+                static_cast<unsigned long long>(stats.no_frame_cycles));
+    std::printf("  Domain 读取失败   : %12d\n", 0);
+    std::printf("  通信成功率        : %12.6f %%\n", success_rate);
+    std::printf("  WC 最小 / 最大    : %12d / %d\n",
+                stats.min_wkc == INT_MAX ? 0 : stats.min_wkc,
+                stats.max_wkc == INT_MIN ? 0 : stats.max_wkc);
+
+    std::printf("[DC 同步质量]\n");
+    std::printf("  有效 / 无效采样   : %12llu / %llu\n",
+                static_cast<unsigned long long>(stats.dc_valid_samples),
+                static_cast<unsigned long long>(stats.dc_invalid_samples));
+    std::printf("  平均绝对误差      : %12.3f us\n", dc_avg_abs_us);
+    std::printf("  最大绝对误差      : %12.3f us\n",
+                ns_to_us(stats.max_dc_diff_ns));
+
+    std::printf("[PDO 与从站状态]\n");
     for (std::size_t i = 0; i < kServoCount; ++i) {
         const ServoRxPdo *rx = app.servo_rx[i];
         const ServoTxPdo *tx = app.servo_tx[i];
-        std::printf("  Servo %zu status/mode/pos/vel/err: "
+        std::printf("  Servo %zu actual status/mode/pos/vel/err: "
                     "0x%04X / %d / %d / %d / 0x%08X\n",
                     i + 1,
-                    tx ? tx->status_word : 0,
+                    static_cast<unsigned int>(tx ? tx->status_word : 0),
                     tx ? tx->operation_mode_display : 0,
                     tx ? tx->actual_position : 0,
                     tx ? tx->actual_velocity : 0,
-                    tx ? tx->error_code : 0);
-        std::printf("          target ctrl/mode/pos    : "
+                    static_cast<unsigned int>(tx ? tx->error_code : 0));
+        std::printf("          target ctrl/mode/pos          : "
                     "0x%04X / %d / %d\n",
-                    rx ? rx->control_word : 0,
+                    static_cast<unsigned int>(rx ? rx->control_word : 0),
                     rx ? rx->operation_mode : 0,
                     rx ? rx->target_position : 0);
     }
+
+    const EndIoTxPdo *endio = app.endio_tx;
+    std::printf("  EndIO 7 err/din     :       0x%02X / 0x%02X\n",
+                static_cast<unsigned int>(endio ? endio->error_code : 0),
+                static_cast<unsigned int>(endio ? endio->digital_inputs : 0));
+    std::printf("          ai1/ai2/temp : %12u / %u / %d\n",
+                static_cast<unsigned int>(
+                    endio ? endio->analog_voltage_1 : 0),
+                static_cast<unsigned int>(
+                    endio ? endio->analog_voltage_2 : 0),
+                endio ? endio->temperature : 0);
+    std::printf("          acc xyz      : %12d / %d / %d\n",
+                endio ? endio->acceleration_1 : 0,
+                endio ? endio->acceleration_2 : 0,
+                endio ? endio->acceleration_3 : 0);
+    std::printf("          rs485 cnt/len: %12u / %u\n",
+                static_cast<unsigned int>(
+                    endio ? endio->rs485_inputs_count : 0),
+                static_cast<unsigned int>(
+                    endio ? endio->rs485_inputs_len : 0));
+
+    std::printf("[主站与从站状态]\n");
+    std::printf("  主站链路          : %12s\n", link_ok ? "正常" : "异常");
+    std::printf("  响应从站数        : %12d\n", online_count);
+    std::printf("  主站 AL 状态      :       0x%02X\n",
+                static_cast<unsigned int>(
+                    app.context.slavelist[0].state & 0x0FU));
+    std::printf("  从站在线 / OP     : %12d / %d\n",
+                online_count,
+                operational_count);
+    std::printf("  Domain 当前状态   :     wc=%d state=%d\n",
+                app.last_wkc,
+                domain_state);
+    for (std::size_t i = 0; i < kServoCount; ++i) {
+        const uint16_t state =
+            app.context.slavelist[i + 1].state & 0x0FU;
+        std::printf("  Servo %zu AL/online/OP:   0x%02X / %d / %d\n",
+                    i + 1,
+                    static_cast<unsigned int>(state),
+                    state != EC_STATE_NONE ? 1 : 0,
+                    state == EC_STATE_OPERATIONAL ? 1 : 0);
+    }
+    const uint16_t endio_state =
+        app.context.slavelist[kEndIoLogicalId].state & 0x0FU;
+    std::printf("  EndIO 7 AL/online/OP:   0x%02X / %d / %d\n",
+                static_cast<unsigned int>(endio_state),
+                endio_state != EC_STATE_NONE ? 1 : 0,
+                endio_state == EC_STATE_OPERATIONAL ? 1 : 0);
     std::printf("============================================================\n");
 }
 
@@ -765,8 +862,6 @@ OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
     }
 
     ecx_send_processdata(&app->context);
-    g_quality_stats.last_cycle_time_ns = monotonic_raw_ns();
-    g_quality_stats.start_time_ns = g_quality_stats.last_cycle_time_ns;
 
     while (app->run) {
         add_time_ns(&wakeup, kCycleTimeNs + time_offset_ns);
@@ -779,14 +874,22 @@ OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
         app->wkc_check_misses =
             (app->last_wkc == app->expected_wkc) ? 0
                                                  : (app->wkc_check_misses + 1);
+        const bool statistics_active =
+            quality_update_after_op(*app,
+                                    g_quality_stats,
+                                    monotonic_raw_ns(),
+                                    app->last_wkc);
+        const bool record_dc_sample =
+            statistics_active &&
+            (g_quality_stats.cycles % kDcMonitorPeriodCycles == 0);
         if (app->context.slavelist[1].hasdc && app->last_wkc > 0) {
             ec_sync(app->context.DCtime, kCycleTimeNs, &time_offset_ns,
-                    g_quality_stats);
+                    g_quality_stats, record_dc_sample);
+        } else if (record_dc_sample) {
+            ++g_quality_stats.dc_invalid_samples;
         }
 
-        quality_update_after_op(*app, g_quality_stats, monotonic_raw_ns(),
-                                app->last_wkc);
-        if (app->in_op) {
+        if (app->in_op && app->last_wkc == app->expected_wkc) {
             write_cycle_outputs(*app, g_motion_control);
         } else {
             write_default_outputs(*app);
