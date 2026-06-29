@@ -2,17 +2,23 @@
 #define SIASUN_SOEM_PDO_CONFIG_H
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace siasun {
 
-/* 单个 PDO 映射项；SOEM 通过 SDO 写入 index/subindex/bitlen 三元组。*/
+/*
+ * 单个 PDO entry 描述。
+ *
+ * 这些表只描述应用期望的从站默认布局并用于编译期尺寸校验，
+ * 程序不会把它们通过 SDO 写入 0x1600/0x1A00。
+ */
 struct PdoEntry {
     /* 对象字典 index，例如 0x607A 表示目标位置。*/
     uint16_t index;
     /* 对象字典 subindex。*/
     uint8_t subindex;
-    /* 该 PDO entry 的位宽，写入 0x1600/0x1A00 映射表低 8 位。*/
+    /* 该 PDO entry 的位宽。*/
     uint8_t bits;
 };
 
@@ -197,6 +203,26 @@ struct EndIoTxPdo {
     uint8_t rs485_inputs_data[32];
 };
 #pragma pack(pop)
+
+/* 编译期确认 packed 结构体和 PDO entry 位宽总和完全一致。*/
+template <std::size_t N>
+constexpr std::size_t pdo_mapped_bytes(
+    const std::array<PdoEntry, N> &entries) {
+    std::size_t bits = 0;
+    for (const PdoEntry &entry : entries) {
+        bits += entry.bits;
+    }
+    return (bits + 7U) / 8U;
+}
+
+static_assert(sizeof(ServoRxPdo) == pdo_mapped_bytes(kServoRxPdoEntries),
+              "ServoRxPdo does not match 0x1600 mapping");
+static_assert(sizeof(ServoTxPdo) == pdo_mapped_bytes(kServoTxPdoEntries),
+              "ServoTxPdo does not match 0x1A00 mapping");
+static_assert(sizeof(EndIoRxPdo) == pdo_mapped_bytes(kEndIoRxPdoEntries),
+              "EndIoRxPdo does not match 0x1600 mapping");
+static_assert(sizeof(EndIoTxPdo) == pdo_mapped_bytes(kEndIoTxPdoEntries),
+              "EndIoTxPdo does not match 0x1A00 mapping");
 
 }  // namespace siasun
 

@@ -52,7 +52,7 @@ struct App {
     bool in_op = false;
 };
 
-/* 初始化 SOEM 主站、下发 XML 参数、配置 PDO/DC、创建周期线程并进入 OP。*/
+/* 初始化主站、下发 XML 参数、映射从站默认 PDO、配置 DC 并进入 OP。*/
 int configure(App &app,
               const char *ifname,
               const std::string &axis_config_directory);
