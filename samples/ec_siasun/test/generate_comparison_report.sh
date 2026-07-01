@@ -164,20 +164,25 @@ soem_cpu_load="$(extract_setting "${SOEM_ENV}" "CPU_LOAD")"
 soem_vm_workers="$(extract_setting "${SOEM_ENV}" "VM_WORKERS")"
 soem_vm_bytes="$(extract_setting "${SOEM_ENV}" "VM_BYTES")"
 soem_endio="$(extract_setting "${SOEM_ENV}" "REQUIRE_ENDIO_OP")"
-soem_gate="$(extract_label "${SOEM_LOG}" "required topology")"
-soem_cycles="$(extract_label "${SOEM_LOG}" "cycles")"
-soem_avg_period="$(extract_label "${SOEM_LOG}" "avg period")"
-soem_period_range="$(extract_label "${SOEM_LOG}" "min / max period")"
-soem_avg_jitter="$(extract_label "${SOEM_LOG}" "avg abs jitter")"
-soem_max_jitter="$(extract_label "${SOEM_LOG}" "max abs jitter")"
-soem_overruns="$(extract_label "${SOEM_LOG}" "severe overruns")"
-soem_good_bad="$(extract_label "${SOEM_LOG}" "good / bad cycles")"
-soem_no_frame="$(extract_label "${SOEM_LOG}" "no frame cycles")"
-soem_success="$(extract_label "${SOEM_LOG}" "success rate")"
-soem_wc="$(extract_label "${SOEM_LOG}" "expected WKC")"
-soem_dc_samples="$(extract_label "${SOEM_LOG}" "DC valid samples")"
-soem_dc_values="$(extract_label "${SOEM_LOG}" "DC current / avg / max")"
-soem_recovery="$(extract_label "${SOEM_LOG}" "recovery events")"
+if [[ "${soem_endio}" == "1" ]]; then
+    soem_gate="minimum 6 Servo + EndIO"
+else
+    soem_gate="minimum 6 Servo"
+fi
+soem_cycles="$(extract_label "${SOEM_LOG}" "累计周期")"
+soem_avg_period="$(extract_label "${SOEM_LOG}" "平均实际周期")"
+soem_period_range="$(extract_label "${SOEM_LOG}" "最小 / 最大周期")"
+soem_avg_jitter="$(extract_label "${SOEM_LOG}" "平均绝对抖动")"
+soem_max_jitter="$(extract_label "${SOEM_LOG}" "最大绝对抖动")"
+soem_overruns="$(extract_label "${SOEM_LOG}" "严重超周期次数")"
+soem_complete="$(extract_label "${SOEM_LOG}" "完整周期")"
+soem_incomplete="$(extract_label "${SOEM_LOG}" "不完整周期")"
+soem_no_frame="$(extract_label "${SOEM_LOG}" "无过程数据周期")"
+soem_success="$(extract_label "${SOEM_LOG}" "通信成功率")"
+soem_wc="$(extract_label "${SOEM_LOG}" "WC 最小 / 最大")"
+soem_dc_samples="$(extract_label "${SOEM_LOG}" "有效 / 无效采样")"
+soem_dc_avg="$(extract_label "${SOEM_LOG}" "平均绝对误差")"
+soem_dc_max="$(extract_label "${SOEM_LOG}" "最大绝对误差")"
 soem_cpu_percent="$(extract_resource "${SOEM_LOG}" "cpu_percent")"
 soem_rss="$(extract_resource "${SOEM_LOG}" "max_rss_kb")"
 soem_voluntary="$(extract_resource "${SOEM_LOG}" "voluntary_cs")"
@@ -234,23 +239,22 @@ report_date="$(date --iso-8601=seconds)"
     printf '## 通讯完整性\n\n'
     printf '| 指标 | IgH | SOEM |\n'
     printf '| --- | ---: | ---: |\n'
-    printf '| 完整 / Good 周期 | %s | %s |\n' \
-        "${igh_complete}" "${soem_good_bad}"
-    printf '| 不完整周期 | %s | 见 Good / Bad |\n' "${igh_incomplete}"
+    printf '| 完整周期 | %s | %s |\n' "${igh_complete}" "${soem_complete}"
+    printf '| 不完整周期 | %s | %s |\n' \
+        "${igh_incomplete}" "${soem_incomplete}"
     printf '| 无数据 / 无帧周期 | %s | %s |\n' \
         "${igh_no_data}" "${soem_no_frame}"
     printf '| 通信成功率 | %s | %s |\n' "${igh_success}" "${soem_success}"
     printf '| WC | %s | %s |\n' "${igh_wc}" "${soem_wc}"
-    printf '| SOEM 状态/重配/恢复事件 | - | %s |\n\n' "${soem_recovery}"
+    printf '\n'
 
     printf '## DC 数据\n\n'
     printf '| 指标 | IgH | SOEM |\n'
     printf '| --- | ---: | ---: |\n'
-    printf '| 样本 | 有效/无效：%s | 有效：%s |\n' \
+    printf '| 样本 | 有效/无效：%s | 有效/无效：%s |\n' \
         "${igh_dc_samples}" "${soem_dc_samples}"
-    printf '| 平均绝对误差 | %s | 见下一行 avg |\n' "${igh_dc_avg}"
-    printf '| 最大绝对误差 | %s | 见下一行 max |\n' "${igh_dc_max}"
-    printf '| current / avg / max | - | %s |\n\n' "${soem_dc_values}"
+    printf '| 平均绝对误差 | %s | %s |\n' "${igh_dc_avg}" "${soem_dc_avg}"
+    printf '| 最大绝对误差 | %s | %s |\n\n' "${igh_dc_max}" "${soem_dc_max}"
 
     printf '> 注意：IgH 数据来自 `sync monitor`，用于观察 DC 从站相对参考时钟'
     printf '的差值；SOEM 数据来自本地周期与 `DCtime` 的 PI 相位误差。'

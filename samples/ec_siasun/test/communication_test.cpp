@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sched.h>
 #include <string>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -71,6 +72,16 @@ double timeval_to_seconds(const timeval &value) {
            static_cast<double>(value.tv_usec) / 1000000.0;
 }
 
+/* 记录压力测试实际获得的调度策略、优先级和当前 CPU。 */
+void print_realtime_state() {
+    sched_param parameter {};
+    sched_getparam(0, &parameter);
+    std::printf("[RT] actual policy=%d priority=%d cpu=%d\n",
+                sched_getscheduler(0),
+                parameter.sched_priority,
+                sched_getcpu());
+}
+
 /*
  * 打印测试通讯窗口的进程资源占用。
  *
@@ -119,7 +130,7 @@ void print_usage(const char *program_name) {
         "usage: %s ifname [AxisXmlDirectory] [duration_s] "
         "[require_endio_op]\n"
         "defaults: duration_s=60 require_endio_op=0\n"
-        "require_endio_op=0 judges communication using Servo 1-6 only\n",
+        "require_endio_op=0 allows a six-servo topology\n",
         program_name);
 }
 
@@ -141,7 +152,7 @@ int main(int argc, char *argv[]) {
     /* duration_seconds：周期通讯测试时长。 */
     unsigned int duration_seconds = 60;
 
-    /* require_endio_op：1 要求7站 OP，0 只要求6个伺服 OP。 */
+    /* require_endio_op：1 要求至少7站，0 允许只有6个伺服。 */
     unsigned int require_endio_op = 0;
 
     if ((argc > 3 &&
@@ -175,11 +186,12 @@ int main(int argc, char *argv[]) {
                 axis_config_directory.c_str());
     std::printf("[TEST] communication gate=%s\n",
                 require_endio_op == 1
-                    ? "Servo 1-6 + EndIO 7"
-                    : "Servo 1-6 only; EndIO 7 is optional");
+                    ? "minimum topology: Servo 1-6 + EndIO 7"
+                    : "minimum topology: Servo 1-6");
 
     install_signal_handlers();
     siasun::setup_realtime_process();
+    print_realtime_state();
 
     /* app：SOEM SIASUN 主站运行上下文。 */
     siasun::App app;

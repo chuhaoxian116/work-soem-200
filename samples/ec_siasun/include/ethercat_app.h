@@ -41,8 +41,6 @@ struct App {
     int wkc_check_misses = 0;
     /* 当前使用的 SOEM group；本例所有从站均放在 group 0。*/
     int current_group = 0;
-    /* 质量统计和状态恢复必须覆盖的前置从站数量。*/
-    std::size_t required_slave_count = kExpectedSlaveCount;
 
     /* 线程运行标志；置 0 后 RT/check 线程自然退出循环。*/
     volatile int run = 0;
@@ -52,10 +50,6 @@ struct App {
     volatile int do_run = 0;
     /* 应用层 OP 标志；置 1 后才允许写入第 6 轴运动控制 PDO。*/
     bool in_op = false;
-    /* true 要求 EndIO；false 只要求 6 个伺服。*/
-    bool require_endio = true;
-    /* EndIO PDO 已映射并可安全访问。*/
-    bool endio_configured = false;
 };
 
 /* 初始化主站、下发 XML 参数、映射从站默认 PDO、配置 DC 并进入 OP。*/

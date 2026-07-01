@@ -181,9 +181,7 @@ void ec_sync(int64 reftime,
  * 这里只改变 SOEM 的读取方式，不会写或清空从站 PDO 映射。
  */
 void use_standard_pdo_mapping_reads(App &app) {
-    for (int slave = 1;
-         slave <= static_cast<int>(app.required_slave_count);
-         ++slave) {
+    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
         ec_slavet &item = app.context.slavelist[slave];
         item.CoEdetails = static_cast<uint8_t>(
             item.CoEdetails & static_cast<uint8_t>(~ECT_COEDET_SDOCA));
@@ -209,62 +207,38 @@ void print_process_data_sm_config(const App &app, const char *stage) {
 }
 
 /*
- * 请求必需从站切换状态。
+ * 请求整条 EtherCAT 总线切换状态。
  *
- * 7 站完整模式使用广播；6 轴测试模式只操作前 6 个伺服，避免可见但异常的
- * EndIO 阻止 PRE_OP/SAFE_OP/OP 判定。
+ * state：目标 AL 状态，例如 SAFE_OP 或 OP。
+ * name：目标状态名称，仅用于日志。
  */
-bool request_required_state(ecx_contextt *context,
-                            uint16_t state,
-                            const char *name,
-                            std::size_t required_slave_count) {
-    const bool all_discovered_required =
-        required_slave_count == static_cast<std::size_t>(context->slavecount);
-
-    if (all_discovered_required) {
-        context->slavelist[0].state = state;
-        const int broadcast_wkc = ecx_writestate(context, 0);
-        std::printf("[STATE] request %s broadcast wkc=%d\n",
-                    name,
-                    broadcast_wkc);
-        if (ecx_statecheck(context, 0, state, EC_TIMEOUTSTATE) == state) {
-            ecx_readstate(context);
-            std::printf("%s OK for %zu required slave(s)\n",
-                        name,
-                        required_slave_count);
-            return true;
-        }
-    } else {
-        for (std::size_t slave = 1; slave <= required_slave_count; ++slave) {
-            context->slavelist[slave].state = state;
-            const int write_wkc =
-                ecx_writestate(context, static_cast<uint16_t>(slave));
-            std::printf("[STATE] request %s slave=%zu wkc=%d\n",
-                        name,
-                        slave,
-                        write_wkc);
-        }
+bool request_state(ecx_contextt *context, uint16_t state, const char *name) {
+    context->slavelist[0].state = state;
+    const int broadcast_wkc = ecx_writestate(context, 0);
+    std::printf("[STATE] request %s broadcast wkc=%d\n",
+                name,
+                broadcast_wkc);
+    if (ecx_statecheck(context, 0, state, EC_TIMEOUTSTATE) == state) {
+        ecx_readstate(context);
+        std::printf("%s OK\n", name);
+        return true;
     }
 
     ecx_readstate(context);
-    bool all_reached = true;
-    for (std::size_t slave = 1; slave <= required_slave_count; ++slave) {
+    bool retried = false;
+    for (int slave = 1; slave <= context->slavecount; ++slave) {
         if ((context->slavelist[slave].state & 0x0FU) ==
             (state & 0x0FU)) {
             continue;
         }
 
-        all_reached = false;
+        retried = true;
         const uint16_t previous_state = context->slavelist[slave].state;
         context->slavelist[slave].state = state;
-        const int retry_wkc =
-            ecx_writestate(context, static_cast<uint16_t>(slave));
+        const int retry_wkc = ecx_writestate(context, slave);
         const uint16_t reached =
-            ecx_statecheck(context,
-                           static_cast<uint16_t>(slave),
-                           state,
-                           EC_TIMEOUTSTATE);
-        std::printf("[STATE] slave=%zu %s retry: previous=0x%02X "
+            ecx_statecheck(context, slave, state, EC_TIMEOUTSTATE);
+        std::printf("[STATE] slave=%d %s retry: previous=0x%02X "
                     "write_wkc=%d reached=0x%02X AL=0x%04X\n",
                     slave,
                     name,
@@ -275,27 +249,15 @@ bool request_required_state(ecx_contextt *context,
                         context->slavelist[slave].ALstatuscode));
     }
 
-    if (!all_reached) {
+    if (retried &&
+        ecx_statecheck(context, 0, state, EC_TIMEOUTSTATE) == state) {
         ecx_readstate(context);
-        all_reached = true;
-        for (std::size_t slave = 1; slave <= required_slave_count; ++slave) {
-            if ((context->slavelist[slave].state & 0x0FU) !=
-                (state & 0x0FU)) {
-                all_reached = false;
-            }
-        }
-    }
-    if (all_reached) {
-        std::printf("%s OK for %zu required slave(s)\n",
-                    name,
-                    required_slave_count);
+        std::printf("%s OK after individual retry\n", name);
         return true;
     }
 
-    std::fprintf(stderr,
-                 "failed to enter %s for %zu required slave(s)\n",
-                 name,
-                 required_slave_count);
+    std::fprintf(stderr, "failed to enter %s\n", name);
+    ecx_readstate(context);
     for (int slave = 1; slave <= context->slavecount; ++slave) {
         std::fprintf(stderr, "slave %d state=0x%02X AL=0x%04X %s\n",
                      slave,
@@ -499,15 +461,14 @@ void quality_update_cycle(QualityStats &stats, int64_t now_ns) {
     }
 }
 
-/* 判断 WKC 是否覆盖当前测试要求的通讯对象。*/
-bool required_wkc_received(const App &app, int wkc) {
-    return app.require_endio ? wkc == app.expected_wkc
-                             : wkc >= app.expected_wkc;
-}
-
-/* 更新 WKC 质量统计。*/
-void quality_update_wkc(QualityStats &stats, int wkc, const App &app) {
-    if (required_wkc_received(app, wkc)) {
+/*
+ * 更新 WKC 质量统计。
+ *
+ * wkc：本周期收到的 Working Counter。
+ * expected_wkc：PDO 映射后计算出的期望 WKC。
+ */
+void quality_update_wkc(QualityStats &stats, int wkc, int expected_wkc) {
+    if (wkc == expected_wkc) {
         ++stats.good_wkc_cycles;
     } else {
         ++stats.bad_wkc_cycles;
@@ -538,16 +499,14 @@ bool quality_update_after_op(App &app,
         stats.start_time_ns = now_ns;
         stats.last_cycle_time_ns = now_ns;
         stats.cycles = 1;
-        quality_update_wkc(stats, wkc, app);
-        std::printf("[QUALITY] %zu 个必需从站进入 OP，"
-                    "开始控制并记录通信/DC 质量（EndIO required=%s）\n",
-                    app.required_slave_count,
-                    app.require_endio ? "yes" : "no");
+        quality_update_wkc(stats, wkc, app.expected_wkc);
+        std::printf("[QUALITY] 全部 7 个从站进入 OP，"
+                    "开始控制并记录通信/DC 质量\n");
         return true;
     }
 
     quality_update_cycle(stats, now_ns);
-    quality_update_wkc(stats, wkc, app);
+    quality_update_wkc(stats, wkc, app.expected_wkc);
     return true;
 }
 
@@ -592,9 +551,7 @@ void print_quality_report(App &app,
 
     int online_count = 0;
     int operational_count = 0;
-    for (int slave = 1;
-         slave <= static_cast<int>(app.required_slave_count);
-         ++slave) {
+    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
         const uint16_t state = app.context.slavelist[slave].state & 0x0FU;
         if (state != EC_STATE_NONE) {
             ++online_count;
@@ -604,12 +561,9 @@ void print_quality_report(App &app,
         }
     }
     const bool link_ok =
-        app.last_wkc > 0 &&
-        online_count == static_cast<int>(app.required_slave_count);
+        app.last_wkc > 0 && online_count == app.context.slavecount;
     const int domain_state =
-        required_wkc_received(app, app.last_wkc)
-            ? 2
-            : (app.last_wkc > 0 ? 1 : 0);
+        app.last_wkc == app.expected_wkc ? 2 : (app.last_wkc > 0 ? 1 : 0);
 
     std::printf("\n============================================================\n");
     std::printf("%s",
@@ -618,15 +572,12 @@ void print_quality_report(App &app,
                     : "                 SOEM 通信质量报告（周期汇总）\n");
     std::printf("============================================================\n");
     if (!stats.active) {
-        std::printf("  %zu 个必需从站尚未全部进入 OP，未记录运行质量数据。\n",
-                    app.required_slave_count);
+        std::printf("  尚未进入全部从站 OP 状态，未记录运行质量数据。\n");
         std::printf("============================================================\n");
         return;
     }
 
     std::printf("[运行概况]\n");
-    std::printf("  判定对象          : %12s\n",
-                app.require_endio ? "6 Servo + EndIO" : "6 Servo only");
     std::printf("  运行时长          : %12.3f s\n", runtime_s);
     std::printf("  累计周期          : %12llu\n",
                 static_cast<unsigned long long>(stats.cycles));
@@ -656,9 +607,6 @@ void print_quality_report(App &app,
     std::printf("  WC 最小 / 最大    : %12d / %d\n",
                 stats.min_wkc == INT_MAX ? 0 : stats.min_wkc,
                 stats.max_wkc == INT_MIN ? 0 : stats.max_wkc);
-    std::printf("  期望 WKC          : %11s%d\n",
-                app.require_endio ? "=" : ">=",
-                app.expected_wkc);
 
     std::printf("[DC 同步质量]\n");
     std::printf("  有效 / 无效采样   : %12llu / %llu\n",
@@ -667,49 +615,6 @@ void print_quality_report(App &app,
     std::printf("  平均绝对误差      : %12.3f us\n", dc_avg_abs_us);
     std::printf("  最大绝对误差      : %12.3f us\n",
                 ns_to_us(stats.max_dc_diff_ns));
-
-    std::printf("[恢复统计]\n");
-    std::printf("  状态异常 / 重配置 / 恢复: %8llu / %llu / %llu\n",
-                static_cast<unsigned long long>(stats.state_error_events),
-                static_cast<unsigned long long>(
-                    stats.reconfiguration_events),
-                static_cast<unsigned long long>(stats.recovery_events));
-
-    /* 保留压力测试报告脚本使用的稳定英文标签。*/
-    std::printf("[压力测试摘要]\n");
-    std::printf("  cycles               : %12llu\n",
-                static_cast<unsigned long long>(stats.cycles));
-    std::printf("  avg period           : %12.3f us\n", avg_period_us);
-    std::printf("  min / max period     : %12.3f / %.3f us\n",
-                stats.interval_samples ? ns_to_us(stats.min_cycle_ns) : 0.0,
-                stats.interval_samples ? ns_to_us(stats.max_cycle_ns) : 0.0);
-    std::printf("  avg abs jitter       : %12.3f us\n", avg_jitter_us);
-    std::printf("  max abs jitter       : %12.3f us\n",
-                ns_to_us(stats.max_abs_jitter_ns));
-    std::printf("  severe overruns      : %12llu\n",
-                static_cast<unsigned long long>(stats.severe_overruns));
-    std::printf("  required topology    : %12s\n",
-                app.require_endio ? "6 Servo + EndIO" : "6 Servo only");
-    std::printf("  expected WKC         : %11s%d\n",
-                app.require_endio ? "=" : ">=",
-                app.expected_wkc);
-    std::printf("  good / bad cycles    : %12llu / %llu\n",
-                static_cast<unsigned long long>(stats.good_wkc_cycles),
-                static_cast<unsigned long long>(stats.bad_wkc_cycles));
-    std::printf("  no frame cycles      : %12llu\n",
-                static_cast<unsigned long long>(stats.no_frame_cycles));
-    std::printf("  success rate         : %12.6f %%\n", success_rate);
-    std::printf("  DC valid samples     : %12llu\n",
-                static_cast<unsigned long long>(stats.dc_valid_samples));
-    std::printf("  DC current / avg / max: %10.3f / %.3f / %.3f us\n",
-                ns_to_us(stats.dc_time_error_ns),
-                dc_avg_abs_us,
-                ns_to_us(stats.max_dc_diff_ns));
-    std::printf("  recovery events      : state=%llu reconfig=%llu recover=%llu\n",
-                static_cast<unsigned long long>(stats.state_error_events),
-                static_cast<unsigned long long>(
-                    stats.reconfiguration_events),
-                static_cast<unsigned long long>(stats.recovery_events));
 
     std::printf("[PDO 与从站状态]\n");
     for (std::size_t i = 0; i < kServoCount; ++i) {
@@ -772,9 +677,7 @@ void print_quality_report(App &app,
                     state == EC_STATE_OPERATIONAL ? 1 : 0);
     }
     const uint16_t endio_state =
-        app.context.slavecount >= static_cast<int>(kEndIoLogicalId)
-            ? app.context.slavelist[kEndIoLogicalId].state & 0x0FU
-            : static_cast<uint16_t>(EC_STATE_NONE);
+        app.context.slavelist[kEndIoLogicalId].state & 0x0FU;
     std::printf("  EndIO 7 AL/online/OP:   0x%02X / %d / %d\n",
                 static_cast<unsigned int>(endio_state),
                 endio_state != EC_STATE_NONE ? 1 : 0,
@@ -802,20 +705,18 @@ void validate_slave_identity(App &app) {
         }
     }
 
-    if (app.context.slavecount >= static_cast<int>(kEndIoLogicalId)) {
-        const ec_slavet &endio =
-            app.context.slavelist[kEndIoLogicalId];
-        if (endio.eep_man != kVendorId ||
-            endio.eep_id != kEndIoProductCode) {
-            std::fprintf(
-                stderr,
-                "warning: EndIO expected vendor/product 0x%08X/0x%08X, "
-                "got 0x%08X/0x%08X\n",
-                kVendorId,
-                kEndIoProductCode,
-                endio.eep_man,
-                endio.eep_id);
-        }
+    if (app.context.slavecount < static_cast<int>(kEndIoLogicalId)) {
+        return;
+    }
+    const ec_slavet &endio = app.context.slavelist[kEndIoLogicalId];
+    if (endio.eep_man != kVendorId || endio.eep_id != kEndIoProductCode) {
+        std::fprintf(stderr,
+                     "warning: EndIO expected vendor/product 0x%08X/0x%08X, "
+                     "got 0x%08X/0x%08X\n",
+                     kVendorId,
+                     kEndIoProductCode,
+                     endio.eep_man,
+                     endio.eep_id);
     }
 }
 
@@ -844,12 +745,7 @@ void print_mailbox_config(const App &app, const char *stage) {
 
 int prepare_mailboxes(App &app) {
     print_mailbox_config(app, "after ecx_config_init");
-    return request_required_state(&app.context,
-                                  EC_STATE_PRE_OP,
-                                  "PRE_OP",
-                                  app.required_slave_count)
-               ? 0
-               : -1;
+    return request_state(&app.context, EC_STATE_PRE_OP, "PRE_OP") ? 0 : -1;
 }
 
 void configure_distributed_clocks(App &app) {
@@ -868,14 +764,15 @@ void configure_distributed_clocks(App &app) {
         }
     }
 
-    if (app.context.slavecount >= static_cast<int>(kEndIoLogicalId)) {
-        ec_slavet &endio = app.context.slavelist[kEndIoLogicalId];
-        if (endio.hasdc) {
-            ecx_dcsync0(&app.context, kEndIoLogicalId, FALSE, 0, 0);
-        }
-        std::printf("[DC] EndIO=%u uses SM synchronization, Sync0 disabled\n",
-                    static_cast<unsigned int>(kEndIoLogicalId));
+    if (app.context.slavecount < static_cast<int>(kEndIoLogicalId)) {
+        return;
     }
+    ec_slavet &endio = app.context.slavelist[kEndIoLogicalId];
+    if (endio.hasdc) {
+        ecx_dcsync0(&app.context, kEndIoLogicalId, FALSE, 0, 0);
+    }
+    std::printf("[DC] EndIO=%u uses SM synchronization, Sync0 disabled\n",
+                static_cast<unsigned int>(kEndIoLogicalId));
 }
 
 /*
@@ -920,9 +817,6 @@ int assign_pdo_pointers(App &app) {
                 ok = false;
             }
         } else if (slave == static_cast<int>(kEndIoLogicalId)) {
-            if (!app.endio_configured) {
-                continue;
-            }
             app.endio_rx = reinterpret_cast<EndIoRxPdo *>(item.outputs);
             app.endio_tx = reinterpret_cast<EndIoTxPdo *>(item.inputs);
             if (!app.endio_rx || !app.endio_tx ||
@@ -973,7 +867,7 @@ OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
         wakeup.tv_nsec -= 1000000000L;
     }
 
-    ecx_send_processdata_group(&app->context, app->current_group);
+    ecx_send_processdata(&app->context);
 
     while (app->run) {
         add_time_ns(&wakeup, kCycleTimeNs + time_offset_ns);
@@ -982,14 +876,10 @@ OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
             continue;
         }
 
-        app->last_wkc = ecx_receive_processdata_group(
-            &app->context,
-            app->current_group,
-            EC_TIMEOUTRET);
+        app->last_wkc = ecx_receive_processdata(&app->context, EC_TIMEOUTRET);
         app->wkc_check_misses =
-            required_wkc_received(*app, app->last_wkc)
-                ? 0
-                : (app->wkc_check_misses + 1);
+            (app->last_wkc == app->expected_wkc) ? 0
+                                                 : (app->wkc_check_misses + 1);
         const bool statistics_active =
             quality_update_after_op(*app,
                                     g_quality_stats,
@@ -1005,7 +895,7 @@ OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
             ++g_quality_stats.dc_invalid_samples;
         }
 
-        if (app->in_op && required_wkc_received(*app, app->last_wkc)) {
+        if (app->in_op && app->last_wkc == app->expected_wkc) {
             write_cycle_outputs(*app, g_motion_control);
         } else {
             write_default_outputs(*app);
@@ -1015,10 +905,8 @@ OSAL_THREAD_FUNC_RT ecatthread(void *arg) {
             print_quality_report(*app, g_quality_stats, false);
         }
 
-        ecx_mbxhandler(&app->context,
-                       static_cast<uint8_t>(app->current_group),
-                       4);
-        ecx_send_processdata_group(&app->context, app->current_group);
+        ecx_mbxhandler(&app->context, 0, 4);
+        ecx_send_processdata(&app->context);
         ++cycle;
     }
 }
@@ -1040,8 +928,7 @@ OSAL_THREAD_FUNC ecatcheck(void *arg) {
             app->context.grouplist[app->current_group].docheckstate = FALSE;
             ecx_readstate(&app->context);
 
-            for (int slave_index = 1;
-                 slave_index <= static_cast<int>(app->required_slave_count);
+            for (int slave_index = 1; slave_index <= app->context.slavecount;
                  ++slave_index) {
                 /* slave：当前检查的 SOEM 从站状态对象。*/
                 ec_slavet *slave = &app->context.slavelist[slave_index];
@@ -1096,48 +983,23 @@ OSAL_THREAD_FUNC ecatcheck(void *arg) {
 }  // namespace
 
 void setup_realtime_process() {
-    const int requested_priority = sched_get_priority_max(SCHED_FIFO);
     sched_param param {};
-    param.sched_priority = requested_priority;
-    const bool scheduler_configured =
-        sched_setscheduler(0, SCHED_FIFO, &param) == 0;
-    if (!scheduler_configured) {
+    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    if (sched_setscheduler(0, SCHED_FIFO, &param) == -1) {
         std::fprintf(stderr, "warning: sched_setscheduler failed: %s\n",
                      std::strerror(errno));
     }
-    const bool memory_locked = mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
-    if (!memory_locked) {
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
         std::fprintf(stderr, "warning: mlockall failed: %s\n",
                      std::strerror(errno));
     }
     prefault_stack();
-
-    const int actual_policy = sched_getscheduler(0);
-    sched_param actual_param {};
-    sched_getparam(0, &actual_param);
-    std::printf("[RT] requested policy=%d priority=%d mlock=on\n",
-                SCHED_FIFO,
-                requested_priority);
-    std::printf("[RT] actual policy=%d priority=%d cpu=%d "
-                "scheduler=%s mlock=%s\n",
-                actual_policy,
-                actual_param.sched_priority,
-                sched_getcpu(),
-                scheduler_configured ? "ok" : "failed",
-                memory_locked ? "ok" : "failed");
 }
 
 int configure(App &app,
               const char *ifname,
               const std::string &axis_config_directory,
               bool require_endio) {
-    app.require_endio = require_endio;
-    app.required_slave_count =
-        require_endio ? kExpectedSlaveCount : kServoCount;
-    app.current_group = require_endio ? 0 : 1;
-    app.endio_configured = false;
-    app.endio_rx = nullptr;
-    app.endio_tx = nullptr;
     app.run = 1;
     app.mapping_done = 0;
     app.do_run = 0;
@@ -1147,9 +1009,6 @@ int configure(App &app,
     g_quality_stats = QualityStats {};
     g_sync_offset_ns = 0;
 
-    std::printf("communication gate: %s\n",
-                require_endio ? "Servo 1-6 + EndIO 7"
-                              : "Servo 1-6 only; EndIO 7 is optional");
     std::printf("SOEM startup on %s\n", ifname);
     if (!ecx_init(&app.context, ifname)) {
         std::fprintf(stderr, "ecx_init failed on %s\n", ifname);
@@ -1160,10 +1019,11 @@ int configure(App &app,
         return -1;
     }
     std::printf("found %d slave(s)\n", app.context.slavecount);
-    if (app.context.slavecount <
-        static_cast<int>(app.required_slave_count)) {
+    const std::size_t minimum_slave_count =
+        require_endio ? kExpectedSlaveCount : kServoCount;
+    if (app.context.slavecount < static_cast<int>(minimum_slave_count)) {
         std::fprintf(stderr, "expected at least %zu slaves, found %d\n",
-                     app.required_slave_count,
+                     minimum_slave_count,
                      app.context.slavecount);
         return -1;
     }
@@ -1171,22 +1031,6 @@ int configure(App &app,
     validate_slave_identity(app);
     if (prepare_mailboxes(app)) {
         return -1;
-    }
-
-    /*
-     * 6 轴模式只映射前 6 个伺服到独立 group，避免 EndIO 进入过程数据 WKC
-     * 和恢复线程判定。其余可见从站保留在默认 group 0。
-     */
-    if (!app.require_endio) {
-        for (std::size_t slave = 1; slave <= kServoCount; ++slave) {
-            app.context.slavelist[slave].group =
-                static_cast<uint8_t>(app.current_group);
-        }
-        for (int slave = static_cast<int>(kServoCount) + 1;
-             slave <= app.context.slavecount;
-             ++slave) {
-            app.context.slavelist[slave].group = 0;
-        }
     }
 
     /* axis_parameters：从 Axis1.xml-Axis6.xml 读取出的 6 轴参数。*/
@@ -1209,10 +1053,8 @@ int configure(App &app,
     configure_distributed_clocks(app);
 
     std::fill(app.io_map.begin(), app.io_map.end(), 0);
-    const int mapped_size = ecx_config_map_group(
-        &app.context,
-        app.io_map.data(),
-        static_cast<uint8_t>(app.current_group));
+    const int mapped_size =
+        ecx_config_map_group(&app.context, app.io_map.data(), 0);
     if (mapped_size <= 0 ||
         static_cast<std::size_t>(mapped_size) > app.io_map.size()) {
         std::fprintf(stderr,
@@ -1225,32 +1067,13 @@ int configure(App &app,
                 mapped_size,
                 app.io_map.size());
     print_process_data_sm_config(app, "after ecx_config_map_group");
-    const int mapped_expected_wkc =
-        (app.context.grouplist[app.current_group].outputsWKC * 2) +
-        app.context.grouplist[app.current_group].inputsWKC;
-    int servo_expected_wkc = 0;
-    for (std::size_t slave = 1; slave <= kServoCount; ++slave) {
-        const ec_slavet &servo = app.context.slavelist[slave];
-        if (servo.Obytes > 0 || servo.Obits > 0) {
-            servo_expected_wkc += 2;
-        }
-        if (servo.Ibytes > 0 || servo.Ibits > 0) {
-            servo_expected_wkc += 1;
-        }
-    }
     app.expected_wkc =
-        app.require_endio ? mapped_expected_wkc : servo_expected_wkc;
-    app.endio_configured =
-        app.require_endio &&
-        app.context.slavecount >= static_cast<int>(kEndIoLogicalId);
-    std::printf("[PDO] group=%d mappedWKC=%d requiredWKC=%s%d "
-                "outputsWKC=%d inputsWKC=%d\n",
-                app.current_group,
-                mapped_expected_wkc,
-                app.require_endio ? "=" : ">=",
+        (app.context.grouplist[0].outputsWKC * 2) +
+        app.context.grouplist[0].inputsWKC;
+    std::printf("[PDO] expectedWKC=%d outputsWKC=%d inputsWKC=%d\n",
                 app.expected_wkc,
-                app.context.grouplist[app.current_group].outputsWKC,
-                app.context.grouplist[app.current_group].inputsWKC);
+                app.context.grouplist[0].outputsWKC,
+                app.context.grouplist[0].inputsWKC);
 
     if (assign_pdo_pointers(app)) {
         return -1;
@@ -1272,20 +1095,14 @@ int configure(App &app,
     }
 
     write_default_outputs(app);
-    if (!request_required_state(&app.context,
-                                EC_STATE_SAFE_OP,
-                                "SAFE_OP",
-                                app.required_slave_count)) {
+    if (!request_state(&app.context, EC_STATE_SAFE_OP, "SAFE_OP")) {
         return -1;
     }
 
     std::printf("SAFE_OP PDO warmup\n");
     for (int i = 0; i < kSafeOpWarmupCycles; ++i) {
-        ecx_send_processdata_group(&app.context, app.current_group);
-        app.last_wkc = ecx_receive_processdata_group(
-            &app.context,
-            app.current_group,
-            EC_TIMEOUTRET);
+        ecx_send_processdata(&app.context);
+        app.last_wkc = ecx_receive_processdata(&app.context, EC_TIMEOUTRET);
         osal_usleep(kCycleTimeNs / 1000);
     }
     std::printf("[PDO] SAFE_OP warmup lastWKC=%d expectedWKC=%d\n",
@@ -1293,17 +1110,12 @@ int configure(App &app,
                 app.expected_wkc);
     write_default_outputs(app);
     for (int i = 0; i < 50; ++i) {
-        ecx_send_processdata_group(&app.context, app.current_group);
-        app.last_wkc = ecx_receive_processdata_group(
-            &app.context,
-            app.current_group,
-            EC_TIMEOUTRET);
+        ecx_send_processdata(&app.context);
+        app.last_wkc = ecx_receive_processdata(&app.context, EC_TIMEOUTRET);
         osal_usleep(kCycleTimeNs / 1000);
     }
 
-    for (int slave = 1;
-         slave <= static_cast<int>(app.required_slave_count);
-         ++slave) {
+    for (int slave = 1; slave <= app.context.slavecount; ++slave) {
         if (app.context.slavelist[slave].CoEdetails > 0) {
             ecx_slavembxcyclic(&app.context, slave);
         }
@@ -1316,19 +1128,11 @@ int configure(App &app,
                 app.last_wkc,
                 app.expected_wkc);
 
-    if (!request_required_state(&app.context,
-                                EC_STATE_OPERATIONAL,
-                                "OPERATIONAL",
-                                app.required_slave_count)) {
+    if (!request_state(&app.context, EC_STATE_OPERATIONAL, "OPERATIONAL")) {
         return -1;
     }
 
     app.in_op = true;
-    std::printf("communication judgment: %s, required WKC %s%d\n",
-                app.require_endio ? "6 Servo + EndIO"
-                                  : "6 Servo only (EndIO optional)",
-                app.require_endio ? "=" : ">=",
-                app.expected_wkc);
     std::printf("OP OK, start 1 ms cyclic communication\n");
     return 0;
 }
@@ -1359,7 +1163,7 @@ void release(App &app) {
     app.do_run = 0;
     app.in_op = false;
     write_default_outputs(app);
-    ecx_send_processdata_group(&app.context, app.current_group);
+    ecx_send_processdata(&app.context);
     osal_usleep(100000);
 
     if (app.context.slavecount > 0) {

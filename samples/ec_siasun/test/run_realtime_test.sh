@@ -6,7 +6,7 @@ set -o pipefail
 # TEST_BIN：被测 SOEM SIASUN 通讯测试程序路径。
 TEST_BIN="${TEST_BIN:-../../../build/samples/ec_siasun/test/ec_siasun_communication_test}"
 # IFNAME：SOEM 直接访问的 EtherCAT 网卡名称。
-IFNAME="${IFNAME:-enp2s0}"
+IFNAME="${IFNAME:-enp1s0}"
 # AXIS_DIR：Axis1.xml-Axis6.xml 所在目录。
 AXIS_DIR="${AXIS_DIR:-../doc/gcr10_1300}"
 # DURATION_S：单次测试持续时间，单位秒。
