@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
 
@@ -129,6 +130,50 @@ void prefault_stack() {
     for (std::size_t i = 0; i < sizeof(dummy); ++i) {
         dummy[i] = 0;
     }
+}
+
+void set_thread_scheduler(OSAL_THREAD_HANDLE handle,
+                          const char *name,
+                          int policy,
+                          int priority) {
+    const pthread_t thread = reinterpret_cast<pthread_t>(handle);
+    const int name_result = pthread_setname_np(thread, name);
+    if (name_result != 0) {
+        std::fprintf(stderr,
+                     "warning: failed to name %s: %s\n",
+                     name,
+                     std::strerror(name_result));
+    }
+
+    sched_param requested {};
+    requested.sched_priority = priority;
+
+    const int set_result =
+        pthread_setschedparam(thread, policy, &requested);
+    if (set_result != 0) {
+        std::fprintf(stderr,
+                     "warning: failed to set %s scheduler: %s\n",
+                     name,
+                     std::strerror(set_result));
+        return;
+    }
+
+    int actual_policy = 0;
+    sched_param actual {};
+    const int get_result =
+        pthread_getschedparam(thread, &actual_policy, &actual);
+    if (get_result != 0) {
+        std::fprintf(stderr,
+                     "warning: failed to read %s scheduler: %s\n",
+                     name,
+                     std::strerror(get_result));
+        return;
+    }
+
+    std::printf("[RT] %s actual policy=%d priority=%d\n",
+                name,
+                actual_policy,
+                actual.sched_priority);
 }
 
 /*
@@ -1086,6 +1131,11 @@ int configure(App &app,
         std::fprintf(stderr, "failed to create SOEM RT thread\n");
         return -1;
     }
+    set_thread_scheduler(app.rt_thread,
+                         "ecatthread",
+                         SCHED_FIFO,
+                         sched_get_priority_max(SCHED_FIFO));
+
     if (!osal_thread_create(&app.check_thread,
                             128000,
                             reinterpret_cast<void *>(ecatcheck),
@@ -1093,6 +1143,7 @@ int configure(App &app,
         std::fprintf(stderr, "failed to create SOEM check thread\n");
         return -1;
     }
+    set_thread_scheduler(app.check_thread, "ecatcheck", SCHED_OTHER, 0);
 
     write_default_outputs(app);
     if (!request_state(&app.context, EC_STATE_SAFE_OP, "SAFE_OP")) {
